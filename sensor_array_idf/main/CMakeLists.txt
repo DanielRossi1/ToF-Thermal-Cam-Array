@@ -1,0 +1,21 @@
+idf_component_register(
+    SRCS
+        "app_main.cpp"
+        "hub_control.cpp"
+        "hub_transport.cpp"
+        "i2c_bus.cpp"
+        "tof_vl53l8ch.cpp"
+        "mlx90640_driver.cpp"
+        "uvc_camera.cpp"
+        "camera_sync.cpp"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        driver
+        nvs_flash
+        esp_timer
+        esp_psram
+        freertos
+        vl53l8ch
+        Adafruit_MLX90640
+        espressif__usb_stream
+)
