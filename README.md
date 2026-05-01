@@ -1,151 +1,103 @@
 # ESP32-S3 Synchronized Sensor Hub
 
-## Hardware
+This repository provides a complete implementation for an **ESP32-S3 Synchronized Sensor Hub**, specifically designed for multimodal data acquisition. The current MCU may be not powerful enought to both acquire data and running a local model.
 
-| Component       | Part            | Interface |
-|-----------------|-----------------|-----------|
-| MCU             | ESP32-S3 DevKitC-1 | —      |
-| ToF             | VL53L8CH (RTrobot board) | I2C 0x52 |
-| Thermal camera  | MLX90640        | I2C 0x33  |
-| RGB camera      | USB UVC module  | USB-OTG   |
-| PC connection   | —               | USB-UART  |
+By fusing high-resolution RGB imagery with the spatial depth data from a Time-of-Flight (ToF) array, this system enables robust depth estimation and object detection even in environments where traditional monocular vision fails.
+
+The thermal camera is there because i just liked the idea to include it.
+
+![hardware](assets/images/sensor-bundle.jpeg)
 
 ---
 
-## Wiring table
+## Introduction
 
-### I2C bus (shared, 4.7kΩ pull-ups SDA→3V3 and SCL→3V3)
+Monocular depth estimation is an **inherently ill-posed problem**. The transformation from a 2D image plane to 3D coordinates—mapping $\mathbb{R}^2 \rightarrow \mathbb{R}^3$—lacks a unique solution without additional geometric priors or contextual assumptions. In real-world applications, image-only methods frequently fail when encountering:
+*   **Extreme lighting conditions** (e.g., high dynamic range or low-light).
+*   **Motion blur** during high-speed ego-motion.
+*   **Textureless surfaces** (e.g., solid white walls, mirrors, or glass).
 
-| Signal  | ESP32-S3 pin | VL53L8CH pad | MLX90640 pad |
-|---------|-------------|--------------|--------------|
-| SDA     | GPIO 8      | SDA          | SDA          |
-| SCL     | GPIO 9      | SCL          | SCL          |
-| VCC     | 3V3         | VCC          | VCC          |
-| GND     | GND         | GND          | GND          |
+To resolve these ambiguities, **multi-modal depth estimation** incorporates active sensors like LiDAR or Radar to provide ground-truth metric constraints. However, these sensors are often prohibitively expensive, bulky, and power-intensive, rendering them unsuitable for edge computing or small-scale robotics.
 
-### VL53L8CH extra pins
+This project bridges the gap by leveraging **Image + Time-of-Flight (ToF) fusion**. By utilizing the **VL53L8CH** multizone sensor, we provide a solution that is:
 
-| Signal | ESP32-S3 pin | Notes                          |
-|--------|-------------|--------------------------------|
-| INT    | GPIO 4      | Active-low interrupt, pull-up  |
-| XSHUT  | GPIO 5      | Pull low to reset (optional)   |
-
-### USB camera (UVC module)
-
-| Camera pad | ESP32-S3 pin       | Notes                         |
-|------------|--------------------|-------------------------------|
-| DM (D+)    | USB-OTG D+         | Direct connection             |
-| DP (D−)    | USB-OTG D−         | Direct connection             |
-| 5V         | USB-OTG VBUS (5V)  | From OTG port                 |
-| GND        | USB-OTG GND        | Common ground                 |
-
-### PC connection
-Connect the **USB-UART** port of the DevKitC-1 to your PC.  
-The USB-OTG port is fully occupied by the camera.
+*   **Cost-Efficient:** Orders of magnitude more affordable than scanning LiDAR systems.
+*   **Low-Latency:** Provides real-world metric anchors at high refresh rates for real-time applications.
+*   **Compact:** Ideal for ESP32-S3-based embedded systems where form factor and power efficiency are critical.
 
 ---
 
-## Arduino libraries (install via Library Manager)
+## The VL53L8CH: Beyond Simple Distance
 
-1. **VL53L8CX** — search "VL53L8CX" → install Pololu or ST version
-2. **SparkFun MLX90640** — search "SparkFun MLX90640"
-3. **esp32-camera** — bundled with ESP32 Arduino core ≥ 2.0.14
-4. **usb_stream** (Espressif) — for UVC host:
-   - IDF component: `idf.py add-dependency "espressif/usb_stream"`
-   - Or via Arduino component manager
+Unlike traditional single-point ToF sensors that provide a single distance value, the **VL53L8CH** is a high-performance, multizone sensor. It functions essentially as a "low-resolution solid-state LiDAR." Key capabilities include:
 
-### Arduino IDE board settings
-
-| Setting            | Value                  |
-|--------------------|------------------------|
-| Board              | ESP32S3 Dev Module     |
-| USB CDC On Boot    | **Disabled**           |
-| USB Mode           | **USB-OTG**            |
-| PSRAM              | OPI PSRAM              |
-| Flash Size         | 8MB (or match your board) |
-| Partition Scheme   | Huge APP (3MB No OTA)  |
-
-> ⚠️  "USB CDC On Boot: Disabled" is critical. If enabled, Serial goes to CDC
-> (OTG port) instead of UART, and your camera won't work.
+*   **Spatial Depth Resolution:** It divides the $45^\circ \times 45^\circ$ square field-of-view into a programmable **$4 \times 4$ or $8 \times 8$ grid**, providing up to 64 independent distance measurements simultaneously.
+*   **Per-Zone Confidence Metrics:** For every zone, the sensor outputs a **Sigma** estimate (representing the noise/standard deviation) and a **Signal Rate**, allowing inference models to weigh data points based on their reliability.
+*   **Ambient Light Immunity:** It reports ambient light levels for each zone, which is critical for correcting depth artifacts in high-exposure outdoor environments.
+*   **Target Status Filtering:** The sensor includes an on-board processing chip that assigns a status code (e.g., "Valid," "Signal Blur," "Wrap Around") to each measurement, ensuring only high-quality ground truth enters your inference pipeline.
 
 ---
 
-## Python setup
+## Hardware Specification
 
-```bash
-pip install pyserial numpy opencv-python matplotlib
-```
-
-### Run with live visualization
-```bash
-python pc_reader.py --port /dev/ttyUSB0
-```
-
-### Run headless (print stats only)
-```bash
-python pc_reader.py --port /dev/ttyUSB0 --headless
-```
-
-### Save all frames to disk
-```bash
-python pc_reader.py --port /dev/ttyUSB0 --save ./frames
-```
-
-Each synchronized frame saves as:
-- `00000001_tof_dist.npy`   — uint16 (8×8) distances in mm
-- `00000001_tof_sigma.npy`  — uint16 (8×8) sigma estimates
-- `00000001_tof_status.npy` — uint8  (8×8) target status (5 = valid)
-- `00000001_thermal.npy`    — float32 (24×32) temperatures °C
-- `00000001_camera.jpg`     — JPEG from USB camera
-- `00000001_meta.txt`       — one-line metadata
+| Component | Part | Interface | Role |
+| :--- | :--- | :--- | :--- |
+| **MCU** | ESP32-S3 DevKitC-1 | — | Central synchronization & processing |
+| **ToF Array** | VL53L8CH (RTrobot) | I2C (0x52) | $8 \times 8$ metric depth map |
+| **Thermal Camera**| MLX90640 | I2C (0x33) | $32 \times 24$ thermal distribution |
+| **RGB Camera** | USB UVC Module | USB-OTG | High-res visual reference |
+| **PC Connection** | — | USB-UART | Data logging & visualization |
 
 ---
 
-## Synchronization strategy
+## Wiring & Interconnectivity
 
-```
-VL53L8CH INT ──► GPIO4 ISR ──► g_tof_ready = true
-                                     │
-                              loop() detects flag
-                                     │
-                         ┌───────────┼───────────┐
-                         ▼           ▼           ▼
-                     read_tof()  read_mlx()  uvc_capture()
-                         │           │           │
-                         └───────────┴───────────┘
-                                     │
-                              send_packet() over UART
-```
+### I2C Shared Bus
+*Requires 4.7kΩ pull-up resistors on SDA and SCL to 3.3V.*
 
-The VL53L8CH fires INT at 30Hz. The MLX90640 is set to 32Hz (slightly faster),
-so its data is always fresh when the ISR triggers. The camera grab is triggered
-at the same instant. Total jitter between sensors is < 1ms.
+| Signal | ESP32-S3 Pin | VL53L8CH | MLX90640 |
+| :--- | :--- | :--- | :--- |
+| **SDA** | GPIO 8 | SDA | SDA |
+| **SCL** | GPIO 9 | SCL | SCL |
+| **3V3** | 3.3V | VCC | VCC |
+| **GND** | GND | GND | GND |
+
+### Specialized Connections
+
+| Signal | ESP32-S3 Pin | Component | Description |
+| :--- | :--- | :--- | :--- |
+| **INT** | GPIO 4 | VL53L8CH | Hardware interrupt for sub-ms sync |
+| **XSHUT** | GPIO 5 | VL53L8CH | Hardware reset (optional) |
+| **D+ (DP)** | USB-OTG D+ | USB Camera | Direct connection |
+| **D- (DM)** | USB-OTG D- | USB Camera | Direct connection |
 
 ---
 
-## UVC camera note
+## Technical Configuration (Arduino IDE)
 
-The `camera_init()` / `uvc_capture()` / `uvc_release()` functions in the `.ino`
-are **stubs**. Replace them with the actual Espressif `usb_stream` API calls:
+To ensure the USB-OTG port is dedicated exclusively to the camera module, use the following board settings:
 
-```cpp
-// Typical usb_stream init
-usb_host_config_t host_cfg = {
-    .skip_phy_setup = false,
-    .intr_flags = ESP_INTR_FLAG_LEVEL1
-};
-usb_host_install(&host_cfg);
-uvc_host_driver_install(NULL);
+| Setting | Value |
+| :--- | :--- |
+| **Board** | ESP32S3 Dev Module |
+| **USB CDC On Boot** | **Disabled** |
+| **USB Mode** | **USB-OTG** |
+| **PSRAM** | OPI PSRAM |
+| **Flash Size** | 8MB (or match your board) |
+| **Partition Scheme** | Huge APP (3MB No OTA) |
 
-uvc_host_stream_config_t stream_cfg = {
-    .callback = frame_callback,
-    .frame_width = 320,
-    .frame_height = 240,
-    .frame_interval = 333333,  // 30fps = 1/30s in 100ns units
-    .interface_num = 1,
-    .interface_alt_num = 1,
-};
-uvc_host_stream_open(0x0000, 0x0000, &stream_cfg, portMAX_DELAY, &uvc_handle);
-```
+> [!WARNING]
+> **"USB CDC On Boot: Disabled"** is critical. If enabled, Serial communication will hijack the OTG port, causing the camera to fail and the system to hang.
 
-Adjust `frame_width`, `frame_height`, and VID/PID to match your camera module.
+---
+
+## Synchronization Strategy
+
+High-fidelity inference requires zero temporal drift between sensors. We implement a **hardware-triggered interrupt strategy**:
+
+1.  **Trigger:** The VL53L8CH is configured to fire a hardware interrupt (**INT**) at **30Hz**.
+2.  **Capture:** Upon the interrupt falling edge, the ESP32-S3 immediately captures the current $8 \times 8$ ToF frame and triggers a DMA-transfer for the UVC camera frame.
+3.  **Buffer:** The MLX90640 runs asynchronously at **32Hz**. When the ToF interrupt triggers, we pull the most recent thermal frame from the buffer. 
+4.  **Result:** Total temporal jitter between sensors is kept **< 1ms**.
+
+---

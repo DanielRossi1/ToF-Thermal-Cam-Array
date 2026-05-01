@@ -367,7 +367,7 @@ void loop() {
   uint32_t cam_len   = 0;
   uint64_t cam_ts_us = 0;
   const bool cam_ok =
-      (g_cam && g_cam_started && g_cam->isStarted() &&
+      (g_cam && g_cam_started && g_cam->isReady() &&
        (mode == hub::StreamMode::All || mode == hub::StreamMode::CamOnly))
           ? g_cam->snapshot(fb->cam_bytes, kCamJpegMax, cam_len, cam_ts_us)
           : false;

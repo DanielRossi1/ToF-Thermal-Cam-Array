@@ -88,6 +88,7 @@ bool UvcCamera::applySettings(const UvcSettings& s) {
     return true;
   }
 
+  cam_ready_ = false;
   // USB_STREAM does not currently support live reconfiguration cleanly; restart.
   // Best-effort.
   usb_.stop();
@@ -104,13 +105,14 @@ void UvcCamera::onFrame(uvc_frame_t* frame, void* user) {
   auto* self = static_cast<UvcCamera*>(user);
   if (!frame || !frame->data || frame->data_bytes == 0) return;
 
-  if (xSemaphoreTake(self->mutex_, 0) == pdTRUE) {
+  if (xSemaphoreTake(self->mutex_, pdMS_TO_TICKS(5)) == pdTRUE) {
     const uint32_t len = (frame->data_bytes <= kCamJpegMax)
                            ? (uint32_t)frame->data_bytes
                            : kCamJpegMax;
     memcpy(self->cam_buf_, frame->data, len);
     self->cam_len_   = len;
     self->cam_ts_us_ = (uint64_t)esp_timer_get_time();
+    self->cam_ready_ = true;
     xSemaphoreGive(self->mutex_);
   }
 }
@@ -119,7 +121,7 @@ bool UvcCamera::snapshot(uint8_t* dst, uint32_t dst_cap, uint32_t& out_len, uint
   out_len   = 0;
   out_ts_us = 0;
   
-  if (!started_ || !mutex_ || !dst || dst_cap == 0) return false;
+  if (!started_ || !cam_ready_ || !mutex_ || !dst || dst_cap == 0) return false;
 
   if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(2)) != pdTRUE) return false;
   const uint32_t n  = cam_len_;

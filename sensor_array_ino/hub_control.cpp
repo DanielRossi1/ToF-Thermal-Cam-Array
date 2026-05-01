@@ -178,7 +178,10 @@ static void handleCmdText(ControlContext& ctx, Transport& tx, uint32_t seq, char
 #if HUB_USE_UVC_CAMERA
       if (ctx.cam_started) {
         size_t used = strlen(buf);
-        snprintf(buf + used, sizeof(buf) - used, "cam_started=%u\\n", (unsigned)(*ctx.cam_started ? 1 : 0));
+        snprintf(buf + used, sizeof(buf) - used,
+                 "cam_started=%u cam_ready=%u\\n",
+                 (unsigned)(*ctx.cam_started ? 1 : 0),
+                 (unsigned)(ctx.cam && ctx.cam->isReady() ? 1 : 0));
       }
 #endif
       tx.sendTextResp(seq, buf);
@@ -276,6 +279,18 @@ static void handleCmdText(ControlContext& ctx, Transport& tx, uint32_t seq, char
         } else if (streqi(kv, "continuous")) {
           if (parseU32(v, n)) s.continuous = (n != 0);
         }
+      }
+
+      static constexpr uint32_t kMinIntervalUs = 66666u;   // 15 fps
+      static constexpr uint32_t kMaxW = 640u;
+      static constexpr uint32_t kMaxH = 480u;
+      if (s.w > kMaxW || s.h > kMaxH) {
+        tx.sendTextResp(seq, "ERR cam w/h exceeds ESP32-S3 USB bandwidth (max 640x480)\n");
+        return;
+      }
+      if (s.interval_us < kMinIntervalUs) {
+        tx.sendTextResp(seq, "ERR cam interval_us too small (min 66666 = 15fps for ESP32-S3 USB)\n");
+        return;
       }
 
       bool ok = ctx.tof->applySettings(s);

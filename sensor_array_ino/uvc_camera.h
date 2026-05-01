@@ -28,6 +28,7 @@ class UvcCamera {
   bool begin();
   void stop();
   bool isStarted() const { return started_; }
+  bool isReady()   const { return cam_ready_; }
   bool deferredBegin();  // Start after FreeRTOS scheduler fully initialized
 
   const UvcSettings& settings() const { return settings_; }
@@ -51,6 +52,7 @@ class UvcCamera {
   uint8_t* usb_tb_ = nullptr;
   uint8_t* usb_fb_ = nullptr;
   bool started_ = false;
+  volatile bool cam_ready_ = false;
 };
 
 }  // namespace hub

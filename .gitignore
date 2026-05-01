@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+sensor_array_idf/build
+sensor_array_idf/managed_components/espressif__cmake_utilities
+sensor_array_idf/managed_components/espressif__usb_stream
+esp/esp-idf
