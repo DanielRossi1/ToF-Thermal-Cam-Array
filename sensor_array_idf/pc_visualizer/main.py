@@ -32,7 +32,7 @@ from PyQt5.QtGui import (
 
 import pyqtgraph as pg
 
-from sensor_array_idf.pc_visualizer.protocol import (
+from protocol import (
     SlipDecoder, parse_message, parse_frame, build_cmd,
     SyncedFrame, TofFrame, MlxFrame,
     MSG_FRAME, MSG_RESP, MSG_EVENT,

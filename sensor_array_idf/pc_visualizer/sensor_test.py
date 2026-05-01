@@ -1,5 +1,5 @@
 import serial
-from sensor_array_idf.pc_visualizer.protocol import SlipDecoder, parse_message, parse_frame, MSG_FRAME
+from protocol import SlipDecoder, parse_message, parse_frame, MSG_FRAME
 
 def on_packet(raw):
     msg = parse_message(raw)
