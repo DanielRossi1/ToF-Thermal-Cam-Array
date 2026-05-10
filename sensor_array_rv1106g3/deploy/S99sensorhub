@@ -1,0 +1,56 @@
+#!/bin/sh
+#
+# /etc/init.d/S99sensorhub
+# Auto-start script for ToF-Thermal sensor hub on Luckfox Pico Max
+#
+
+SENSOR_BIN="/root/sensor_hub"
+LOG_FILE="/tmp/sensor_hub.log"
+PID_FILE="/var/run/sensor_hub.pid"
+
+case "$1" in
+    start)
+        echo "Starting sensor hub..."
+
+        # Export and configure GPIO pins for VL53L8CH ToF sensor
+        # GPIO 55 = ToF INT pin (GPIO1_C7) - input, falling-edge interrupt
+        echo 55 > /sys/class/gpio/export 2>/dev/null
+        echo in > /sys/class/gpio/gpio55/direction 2>/dev/null
+        echo falling > /sys/class/gpio/gpio55/edge 2>/dev/null
+
+        # GPIO 56 = ToF LPn pin (GPIO1_D6) - output, active high
+        echo 56 > /sys/class/gpio/export 2>/dev/null
+        echo out > /sys/class/gpio/gpio56/direction 2>/dev/null
+        echo 1 > /sys/class/gpio/gpio56/value 2>/dev/null
+
+        if [ -x "$SENSOR_BIN" ]; then
+            nohup $SENSOR_BIN > $LOG_FILE 2>&1 &
+            echo $! > $PID_FILE
+            echo "sensor_hub started (PID $(cat $PID_FILE))"
+        else
+            echo "ERROR: $SENSOR_BIN not found or not executable"
+        fi
+        ;;
+
+    stop)
+        echo "Stopping sensor hub..."
+        if [ -f "$PID_FILE" ]; then
+            kill $(cat $PID_FILE) 2>/dev/null
+            rm -f $PID_FILE
+        fi
+        killall -9 sensor_hub 2>/dev/null
+        ;;
+
+    restart)
+        $0 stop
+        sleep 1
+        $0 start
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0
