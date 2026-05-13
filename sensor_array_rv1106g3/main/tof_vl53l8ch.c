@@ -75,9 +75,11 @@ int tof_begin(TofVl53l8ch *tof) {
         // Toggle LOW -> HIGH with proper boot delay
         int vfd = open(val_path, O_WRONLY);
         if (vfd >= 0) {
-            write(vfd, "0", 1);      // 10ms LOW  (hard reset)
+            ssize_t w0 = write(vfd, "0", 1);      // 10ms LOW  (hard reset)
+            (void)w0;
             usleep(10000);
-            write(vfd, "1", 1);      // HIGH = wake up
+            ssize_t w1 = write(vfd, "1", 1);      // HIGH = wake up
+            (void)w1;
             close(vfd);
             usleep(100000);           // 100ms boot time
             fprintf(stderr, "ToF: LPn pin toggled for reset");

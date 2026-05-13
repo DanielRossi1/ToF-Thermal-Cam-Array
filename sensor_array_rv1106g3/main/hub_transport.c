@@ -6,7 +6,10 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
+
+static pthread_mutex_t g_send_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Simple CRC32 (no zlib dependency)
 static uint32_t simple_crc32(uint32_t crc, const uint8_t *buf, size_t len) {
@@ -31,7 +34,7 @@ static uint32_t simple_crc32(uint32_t crc, const uint8_t *buf, size_t len) {
         0xA4D1C46D,0xD3D6F4FB,0x4369E96A,0x346ED9FC,0xAD678846,0xDA60B8D0,
         0x44042D73,0x33031DE5,0xAA0A4C5F,0xDD0D7CC9,0x5005713C,0x270241AA,
         0xBE0B1010,0xC90C2086,0x5768B525,0x206F85B3,0xB966D409,0xCE61E49F,
-        0x5EDEF90E,0x29D9C998,0xB0D09822,0xC7D7A8A8,0x59B33D17,0x2EB40D81,
+        0x5EDEF90E,0x29D9C998,0xB0D09822,0xC7D7A8B4,0x59B33D17,0x2EB40D81,
         0xB7BD5C3B,0xC0BA6CAD,0xEDB88320,0x9ABFB3B6,0x03B6E20C,0x74B1D29A,
         0xEAD54739,0x9DD277AF,0x04DB2615,0x73DC1683,0xE3630B12,0x94643B84,
         0x0D6D6A3E,0x7A6A5AA8,0xE40ECF0B,0x9309FF9D,0x0A00AE27,0x7D079EB1,
@@ -42,7 +45,7 @@ static uint32_t simple_crc32(uint32_t crc, const uint8_t *buf, size_t len) {
         0xD80D2BDA,0xAF0A1B4C,0x36034AF6,0x41047A60,0xDF60EFC3,0xA867DF55,
         0x316E8EEF,0x4669BE79,0xCB61B38C,0xBC66831A,0x256FD2A0,0x5268E236,
         0xCC0C7795,0xBB0B4703,0x220216B9,0x5505262F,0xC5BA3BBE,0xB2BD0B28,
-        0x2BB45A92,0x5CB30A04,0xC2D7FFA7,0xB5D0CF31,0x2CD99E8B,0x5BDEAE1D,
+        0x2BB45A92,0x5CB36A04,0xC2D7FFA7,0xB5D0CF31,0x2CD99E8B,0x5BDEAE1D,
         0x9B64C2B0,0xEC63F226,0x756AA39C,0x026D930A,0x9C0906A9,0xEB0E363F,
         0x72076785,0x05005713,0x95BF4A82,0xE2B87A14,0x7BB12BAE,0x0CB61B38,
         0x92D28E9B,0xE5D5BE0D,0x7CDCEFB7,0x0BDBDF21,0x86D3D2D4,0xF1D4E242,
@@ -120,7 +123,19 @@ int transport_open(Transport *t, const char *path, int baud) {
 }
 
 void transport_close(Transport *t) {
-    if (t->fd >= 0) { close(t->fd); t->fd = -1; }
+    pthread_mutex_lock(&g_send_mutex);
+    int old = t->fd;
+    t->fd = -1;
+    pthread_mutex_unlock(&g_send_mutex);
+    if (old >= 0) close(old);
+}
+
+void transport_set_fd(Transport *t, int fd) {
+    pthread_mutex_lock(&g_send_mutex);
+    int old = t->fd;
+    t->fd = fd;
+    pthread_mutex_unlock(&g_send_mutex);
+    if (old >= 0 && old != fd) close(old);
 }
 
 // ── SLIP encoding ───────────────────────────────────────────────────────────
@@ -152,6 +167,12 @@ static void slip_write(Transport *t, const uint8_t *data, size_t len) {
 
 void transport_send(Transport *t, int type, uint32_t seq, uint64_t ts_us,
                     const void *payload, uint32_t payload_len) {
+    pthread_mutex_lock(&g_send_mutex);
+    if (!t || t->fd < 0) {
+        pthread_mutex_unlock(&g_send_mutex);
+        return;
+    }
+
     MsgHeader hdr;
     hdr.magic       = HUB_MAGIC;
     hdr.version     = HUB_VERSION;
@@ -168,7 +189,10 @@ void transport_send(Transport *t, int type, uint32_t seq, uint64_t ts_us,
     size_t raw_len  = sizeof(hdr) + payload_len + sizeof(crc);
     size_t slip_max = 2 + raw_len * 2;
     uint8_t *buf = malloc(slip_max);
-    if (!buf) return;
+    if (!buf) {
+        pthread_mutex_unlock(&g_send_mutex);
+        return;
+    }
 
     size_t i = 0;
     buf[i++] = SLIP_END;
@@ -210,6 +234,8 @@ void transport_send(Transport *t, int type, uint32_t seq, uint64_t ts_us,
     }
     free(buf);
     #undef SLIP_PUSH
+
+    pthread_mutex_unlock(&g_send_mutex);
 }
 
 void transport_send_text_resp(Transport *t, uint32_t seq, const char *text) {

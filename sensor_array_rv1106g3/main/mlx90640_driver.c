@@ -51,6 +51,9 @@ int mlx_begin(Mlx90640Driver *d) {
 
     MlxSettings def = { MLX90640_CHESS, MLX90640_ADC_18BIT, MLX90640_16_HZ };
     d->settings = def;
+    memset(d->frame_f, 0, sizeof(d->frame_f));
+    d->got_subpage[0] = 0;
+    d->got_subpage[1] = 0;
     fprintf(stderr, "MLX: Successfully initialized at 0x%02X\n", d->addr);
     return mlx_apply_settings(d, &def);
 }
@@ -59,25 +62,33 @@ int mlx_read_frame(Mlx90640Driver *d, MlxDataV1 *out) {
     i2c_bus_lock(d->bus);
     MLX90640_IDF_SetFd(d->bus->fd);
 
-    float frame[MLX_PIXELS];
-    memset(frame, 0, sizeof(frame));   // ← initialize
+    // Non-blocking: check "new data" bit (status register 0x8000, bit3)
+    uint16_t status = 0;
+    if (MLX90640_I2CRead(d->addr, 0x8000, 1, &status) != MLX90640_NO_ERROR) {
+        i2c_bus_unlock(d->bus);
+        return 0;
+    }
+    if ((status & 0x0008u) == 0) {
+        // No new subpage available right now
+        i2c_bus_unlock(d->bus);
+        return 0;
+    }
 
     uint16_t frameData[834];
-    bool got[2] = {false, false};
-
-    // Loop until we have one read of each subpage
-    int safety = 8;
-    while ((!got[0] || !got[1]) && safety-- > 0) {
-        int subpage = MLX90640_GetFrameData(d->addr, frameData);
-        if (subpage < 0) { i2c_bus_unlock(d->bus); return 0; }
-        if (subpage > 1)  continue;
-        float ta = MLX90640_GetTa(frameData, &d->params);
-        MLX90640_CalculateTo(frameData, &d->params, 0.95f, ta - 8.0f, frame);
-        got[subpage] = true;
+    int subpage = MLX90640_GetFrameData(d->addr, frameData);
+    if (subpage < 0 || subpage > 1) {
+        i2c_bus_unlock(d->bus);
+        return 0;
     }
 
     const float ta = MLX90640_GetTa(frameData, &d->params);
+    MLX90640_CalculateTo(frameData, &d->params, 0.95f, ta - 8.0f, d->frame_f);
+    d->got_subpage[subpage] = 1;
+
     i2c_bus_unlock(d->bus);
+
+    // Only publish once we've seen both subpages at least once (avoids half-frame garbage).
+    if (!d->got_subpage[0] || !d->got_subpage[1]) return 0;
 
     memset(out, 0, sizeof(*out));
 
@@ -95,7 +106,7 @@ int mlx_read_frame(Mlx90640Driver *d, MlxDataV1 *out) {
     out->vdd_mV         = 0;
 
     for (uint16_t i = 0; i < MLX_PIXELS; i++)
-        out->frame_cC[i] = to_centi_c(frame[i]);
+        out->frame_cC[i] = to_centi_c(d->frame_f[i]);
 
     return 1;
 }

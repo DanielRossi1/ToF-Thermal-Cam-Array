@@ -14,12 +14,15 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QComboBox, QLineEdit,
     QGroupBox, QSplitter, QAction, QFileDialog, QSpinBox,
-    QCheckBox, QFormLayout, QPlainTextEdit,
+    QCheckBox, QFormLayout, QPlainTextEdit, QTabWidget,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QByteArray
-from PyQt5.QtGui  import QImage, QPixmap, QColor, QFont, QPalette
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QByteArray, QSettings
+from PyQt5.QtGui  import QImage, QPixmap, QColor, QFont, QPalette, QTransform
 
 import pyqtgraph as pg
+
+from calibration_page import CalibrationPage
+from config_page import ConfigPage
 
 from protocol import (
     SlipDecoder, parse_message, parse_frame, build_cmd,
@@ -32,6 +35,9 @@ from protocol import (
 DEFAULT_HOST  = '192.168.1.67'
 DEFAULT_PORT  = 9000
 DEFAULT_PROTO = 'TCP'
+
+# Hot-path logging (packet/frame prints can severely reduce FPS)
+DEBUG_NET = False
 
 TOF_MODES  = ['distance_mm', 'sigma_mm', 'signal_per_spad',
                'reflectance', 'status', 'ambient_per_spad', 'nb_targets']
@@ -136,7 +142,7 @@ class NetworkWorker(QObject):
                             self._running = False
                             break
                         total_bytes += len(chunk)
-                        if total_bytes % 10000 < len(chunk):  # Log every ~10KB
+                        if DEBUG_NET and (total_bytes % 100000 < len(chunk)):
                             print(f'[NET] Received {len(chunk)} bytes (total: {total_bytes})')
                         self._slip.feed(chunk)
                     except socket.timeout:
@@ -156,20 +162,25 @@ class NetworkWorker(QObject):
                 self._running = False
 
     def _on_packet(self, raw: bytes):
-        print(f'[SLIP] Decoded packet: {len(raw)} bytes')
+        if DEBUG_NET:
+            print(f'[SLIP] Decoded packet: {len(raw)} bytes')
         result = parse_message(raw)
         if not result:
-            print(f'[PARSE] parse_message returned None')
+            if DEBUG_NET:
+                print(f'[PARSE] parse_message returned None')
             return
         mtype, seq, ts_us, payload = result
-        print(f'[MSG] type={mtype} seq={seq} payload_len={len(payload)}')
+        if DEBUG_NET:
+            print(f'[MSG] type={mtype} seq={seq} payload_len={len(payload)}')
         if mtype == MSG_FRAME:
             sf = parse_frame(payload)
             if sf:
-                print(f'[FRAME] Parsed frame seq={sf.seq}')
+                if DEBUG_NET:
+                    print(f'[FRAME] Parsed frame seq={sf.seq}')
                 self.frame_received.emit(sf)
             else:
-                print(f'[FRAME] parse_frame returned None')
+                if DEBUG_NET:
+                    print(f'[FRAME] parse_frame returned None')
         elif mtype in (MSG_RESP, MSG_EVENT):
             self.text_received.emit(
                 f'[{seq}] {payload.decode("utf-8", errors="replace")}')
@@ -236,7 +247,28 @@ class TofWidget(QGroupBox):
         self._frame      = None
         self._mode       = 'distance_mm'
         self._target_idx = 0
+        self._rot_k      = 0
+        self._flip_x     = False
+        self._flip_y     = False
         self._setup_ui()
+
+    def set_transform(self, rot_deg: int = 0, flip_x: bool = False, flip_y: bool = False):
+        try:
+            self._rot_k = (int(rot_deg) // 90) % 4
+        except Exception:
+            self._rot_k = 0
+        self._flip_x = bool(flip_x)
+        self._flip_y = bool(flip_y)
+        self._refresh()
+
+    def _apply_transform(self, img2d: np.ndarray) -> np.ndarray:
+        if self._rot_k:
+            img2d = np.rot90(img2d, self._rot_k)
+        if self._flip_x:
+            img2d = np.fliplr(img2d)
+        if self._flip_y:
+            img2d = np.flipud(img2d)
+        return img2d
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -299,7 +331,9 @@ class TofWidget(QGroupBox):
             return
 
         # Reshape flat 64-zone array to 8×8 grid; transpose for (col, row)
-        self._view.set_image(data.reshape(8, 8).T)
+        img = data.reshape(8, 8).T
+        img = self._apply_transform(img)
+        self._view.set_image(img)
 
         valid = tf.status[:, t] == 5   # VL53L8CX status 5 = valid range
         nv    = int(valid.sum())
@@ -320,7 +354,27 @@ class TofWidget(QGroupBox):
 class ThermalWidget(QGroupBox):
     def __init__(self, parent=None):
         super().__init__('Thermal  MLX90640  24×32', parent)
+        self._rot_k  = 0
+        self._flip_x = False
+        self._flip_y = False
         self._setup_ui()
+
+    def set_transform(self, rot_deg: int = 0, flip_x: bool = False, flip_y: bool = False):
+        try:
+            self._rot_k = (int(rot_deg) // 90) % 4
+        except Exception:
+            self._rot_k = 0
+        self._flip_x = bool(flip_x)
+        self._flip_y = bool(flip_y)
+
+    def _apply_transform(self, img2d: np.ndarray) -> np.ndarray:
+        if self._rot_k:
+            img2d = np.rot90(img2d, self._rot_k)
+        if self._flip_x:
+            img2d = np.fliplr(img2d)
+        if self._flip_y:
+            img2d = np.flipud(img2d)
+        return img2d
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -362,7 +416,9 @@ class ThermalWidget(QGroupBox):
             vmin, vmax = float(self._min_sb.value()), float(self._max_sb.value())
 
         clipped = np.clip(pixels, vmin, vmax)
-        self._view.set_image(clipped.T)          # (32 cols, 24 rows)
+        img = clipped.T  # (32 cols, 24 rows)
+        img = self._apply_transform(img)
+        self._view.set_image(img)
         if not auto:
             self._view._hist.setLevels(vmin, vmax)
 
@@ -380,6 +436,9 @@ class ThermalWidget(QGroupBox):
 class CameraWidget(QGroupBox):
     def __init__(self, parent=None):
         super().__init__('RGB Camera', parent)
+        self._rot_deg = 0
+        self._flip_x = False
+        self._flip_y = False
         layout = QVBoxLayout(self)
 
         self._label = QLabel('No frame')
@@ -394,10 +453,24 @@ class CameraWidget(QGroupBox):
         self._stats.setStyleSheet('color: #a5d6a7; font-family: monospace;')
         layout.addWidget(self._stats)
 
+    def set_transform(self, rot_deg: int = 0, flip_x: bool = False, flip_y: bool = False):
+        try:
+            self._rot_deg = int(rot_deg) % 360
+        except Exception:
+            self._rot_deg = 0
+        self._flip_x = bool(flip_x)
+        self._flip_y = bool(flip_y)
+
     def update_frame(self, jpeg: bytes, w: int, h: int, ts_us: int):
         img = QImage.fromData(QByteArray(jpeg), 'JPEG')
         if img.isNull():
             return
+
+        if self._rot_deg:
+            img = img.transformed(QTransform().rotate(self._rot_deg))
+        if self._flip_x or self._flip_y:
+            img = img.mirrored(self._flip_x, self._flip_y)
+
         pix = QPixmap.fromImage(img).scaled(
             self._label.width(), self._label.height(),
             Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -506,6 +579,10 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
 
+        self._settings = QSettings('ToF-Thermal-Cam-Array', 'pc_visualizer')
+        self._config_page.applied.connect(self._apply_config)
+        self._config_page.saved.connect(self._save_config)
+
         # 30 Hz UI refresh timer — keeps Qt repaints off the worker thread
         self._ui_timer = QTimer()
         self._ui_timer.timeout.connect(self._drain)
@@ -515,12 +592,8 @@ class MainWindow(QMainWindow):
         self._reconn_timer = QTimer()
         self._reconn_timer.timeout.connect(self._try_reconnect)
 
-        # Pre-fill CLI defaults
-        self._host_edit.setText(host)
-        self._port_edit.setValue(port)
-        idx = self._proto_cb.findText(proto)
-        if idx >= 0:
-            self._proto_cb.setCurrentIndex(idx)
+        # Load persisted config (overrides CLI defaults if present)
+        self._load_persisted_config(host, port, proto)
 
     # ── UI construction ────────────────────────────────────────────────────────
 
@@ -587,9 +660,12 @@ class MainWindow(QMainWindow):
         split = QSplitter(Qt.Horizontal)
         root.addWidget(split, stretch=1)
 
-        # Left: sensor panels
-        sw = QWidget()
-        sg = QGridLayout(sw)
+        # Left: pages (Live + Calibration)
+        self._tabs = QTabWidget()
+        split.addWidget(self._tabs)
+
+        live = QWidget()
+        sg = QGridLayout(live)
         sg.setSpacing(4)
 
         self._cam_w  = CameraWidget()
@@ -605,7 +681,12 @@ class MainWindow(QMainWindow):
         sg.setColumnStretch(1, 3)
         sg.setColumnStretch(2, 2)
         sg.setColumnStretch(3, 1)
-        split.addWidget(sw)
+
+        self._calib_page = CalibrationPage()
+        self._config_page = ConfigPage()
+        self._tabs.addTab(live, "Live")
+        self._tabs.addTab(self._calib_page, "Calibration")
+        self._tabs.addTab(self._config_page, "Config")
 
         # Right: control panel
         rw = QWidget()
@@ -695,6 +776,77 @@ class MainWindow(QMainWindow):
         split.addWidget(rw)
         split.setSizes([1200, 340])
 
+    # ── Persistent config ───────────────────────────────────────────────────
+
+    def _default_config(self, host: str, port: int, proto: str) -> dict:
+        return {
+            'proto': str(proto).upper(),
+            'host': str(host),
+            'port': int(port),
+            'auto_reconnect': False,
+            'tof_rot': 0,
+            'tof_flip_x': False,
+            'tof_flip_y': False,
+            'mlx_rot': 0,
+            'mlx_flip_x': False,
+            'mlx_flip_y': False,
+            'cam_rot': 0,
+            'cam_flip_x': False,
+            'cam_flip_y': False,
+        }
+
+    def _load_persisted_config(self, host: str, port: int, proto: str):
+        cfg = self._default_config(host, port, proto)
+        s = self._settings
+
+        cfg['proto'] = s.value('net/proto', cfg['proto'], type=str).upper()
+        cfg['host'] = s.value('net/host', cfg['host'], type=str)
+        cfg['port'] = s.value('net/port', cfg['port'], type=int)
+        cfg['auto_reconnect'] = s.value('net/auto_reconnect', cfg['auto_reconnect'], type=bool)
+
+        for p in ('tof', 'mlx', 'cam'):
+            cfg[f'{p}_rot'] = s.value(f'view/{p}_rot', cfg[f'{p}_rot'], type=int)
+            cfg[f'{p}_flip_x'] = s.value(f'view/{p}_flip_x', cfg[f'{p}_flip_x'], type=bool)
+            cfg[f'{p}_flip_y'] = s.value(f'view/{p}_flip_y', cfg[f'{p}_flip_y'], type=bool)
+
+        self._apply_config(cfg)
+        self._config_page.set_config(cfg)
+
+    def _apply_config(self, cfg: dict):
+        # Network bar
+        self._host_edit.setText(str(cfg.get('host', '')).strip())
+        self._port_edit.setValue(int(cfg.get('port', DEFAULT_PORT)))
+        proto = str(cfg.get('proto', 'TCP')).upper()
+        idx = self._proto_cb.findText(proto)
+        if idx >= 0:
+            self._proto_cb.setCurrentIndex(idx)
+        self._auto_reconn_cb.setChecked(bool(cfg.get('auto_reconnect', False)))
+
+        # View transforms
+        self._tof_w.set_transform(cfg.get('tof_rot', 0), cfg.get('tof_flip_x', False), cfg.get('tof_flip_y', False))
+        self._mlx_w.set_transform(cfg.get('mlx_rot', 0), cfg.get('mlx_flip_x', False), cfg.get('mlx_flip_y', False))
+        self._cam_w.set_transform(cfg.get('cam_rot', 0), cfg.get('cam_flip_x', False), cfg.get('cam_flip_y', False))
+
+        # Keep Config tab in sync
+        if hasattr(self, '_config_page') and self._config_page is not None:
+            self._config_page.set_config(cfg)
+
+    def _save_config(self, cfg: dict):
+        s = self._settings
+        s.setValue('net/proto', str(cfg.get('proto', 'TCP')).upper())
+        s.setValue('net/host', str(cfg.get('host', '')).strip())
+        s.setValue('net/port', int(cfg.get('port', DEFAULT_PORT)))
+        s.setValue('net/auto_reconnect', bool(cfg.get('auto_reconnect', False)))
+
+        for p in ('tof', 'mlx', 'cam'):
+            s.setValue(f'view/{p}_rot', int(cfg.get(f'{p}_rot', 0)))
+            s.setValue(f'view/{p}_flip_x', bool(cfg.get(f'{p}_flip_x', False)))
+            s.setValue(f'view/{p}_flip_y', bool(cfg.get(f'{p}_flip_y', False)))
+
+        s.sync()
+        self._apply_config(cfg)
+        self._config_page.set_status('Saved')
+
     # ── Connection ─────────────────────────────────────────────────────────────
 
     def _toggle_connect(self, checked: bool):
@@ -773,6 +925,8 @@ class MainWindow(QMainWindow):
         if sf.cam_jpeg: self._cam_w.update_frame(
             sf.cam_jpeg, sf.cam_w, sf.cam_h, sf.cam_ts_us)
         self._stat_w.update(sf)
+        if hasattr(self, '_calib_page') and self._calib_page is not None:
+            self._calib_page.update_from_synced_frame(sf)
 
     # ── Recording ──────────────────────────────────────────────────────────────
 

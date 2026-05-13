@@ -16,6 +16,10 @@ typedef struct {
 int  transport_open(Transport *t, const char *path, int baud);
 void transport_close(Transport *t);
 
+// Atomically swap the underlying fd used by transport_send().
+// Closes the previous fd (if any). Safe to call while other threads are sending.
+void transport_set_fd(Transport *t, int fd);
+
 void transport_send(Transport *t, int type, uint32_t seq, uint64_t ts_us,
                     const void *payload, uint32_t payload_len);
 

@@ -35,7 +35,7 @@ _crc_table = (
     0xA4D1C46D,0xD3D6F4FB,0x4369E96A,0x346ED9FC,0xAD678846,0xDA60B8D0,
     0x44042D73,0x33031DE5,0xAA0A4C5F,0xDD0D7CC9,0x5005713C,0x270241AA,
     0xBE0B1010,0xC90C2086,0x5768B525,0x206F85B3,0xB966D409,0xCE61E49F,
-    0x5EDEF90E,0x29D9C998,0xB0D09822,0xC7D7A8A8,0x59B33D17,0x2EB40D81,
+    0x5EDEF90E,0x29D9C998,0xB0D09822,0xC7D7A8B4,0x59B33D17,0x2EB40D81,
     0xB7BD5C3B,0xC0BA6CAD,0xEDB88320,0x9ABFB3B6,0x03B6E20C,0x74B1D29A,
     0xEAD54739,0x9DD277AF,0x04DB2615,0x73DC1683,0xE3630B12,0x94643B84,
     0x0D6D6A3E,0x7A6A5AA8,0xE40ECF0B,0x9309FF9D,0x0A00AE27,0x7D079EB1,
@@ -45,8 +45,8 @@ _crc_table = (
     0x38D8C2C4,0x4FDFF252,0xD1BB67F1,0xA6BC5767,0x3FB506DD,0x48B2364B,
     0xD80D2BDA,0xAF0A1B4C,0x36034AF6,0x41047A60,0xDF60EFC3,0xA867DF55,
     0x316E8EEF,0x4669BE79,0xCB61B38C,0xBC66831A,0x256FD2A0,0x5268E236,
-    0xCC0C7795,0xBB0B4703,0x220216B9,0x5505262F,0xC5BA3BBE,0xB2BD0B24,
-    0x2BB45A92,0x5CB30A04,0xC2D7FFA7,0xB5D0CF31,0x2CD99E8B,0x5BDEAE1D,
+    0xCC0C7795,0xBB0B4703,0x220216B9,0x5505262F,0xC5BA3BBE,0xB2BD0B28,
+    0x2BB45A92,0x5CB36A04,0xC2D7FFA7,0xB5D0CF31,0x2CD99E8B,0x5BDEAE1D,
     0x9B64C2B0,0xEC63F226,0x756AA39C,0x026D930A,0x9C0906A9,0xEB0E363F,
     0x72076785,0x05005713,0x95BF4A82,0xE2B87A14,0x7BB12BAE,0x0CB61B38,
     0x92D28E9B,0xE5D5BE0D,0x7CDCEFB7,0x0BDBDF21,0x86D3D2D4,0xF1D4E242,
@@ -242,11 +242,14 @@ def _slip_encode(data: bytes) -> bytes:
 
 # ── Frame parser ──────────────────────────────────────────────────────────────
 
+_crc_mismatch_count = 0
+
 def parse_message(raw: bytes):
     """
     Parse a decoded SLIP frame.
     Returns (msg_type, seq, ts_us, payload_bytes) or None on error.
     """
+    global _crc_mismatch_count
     if len(raw) < HDR_SIZE + CRC_SIZE:
         print(f"[PARSE-DBG] short packet: len={len(raw)} need>={HDR_SIZE+CRC_SIZE}")
         return None
@@ -274,18 +277,16 @@ def parse_message(raw: bytes):
         return None
 
     crc_zlib = zlib.crc32(raw[:HDR_SIZE + plen]) & 0xFFFFFFFF
-    crc_simple = simple_crc32_python(raw[:HDR_SIZE + plen]) & 0xFFFFFFFF
     if crc_zlib != crc_rx:
-        print(f"[PARSE-DBG] crc mismatch: zlib=0x{crc_zlib:08X} simple=0x{crc_simple:08X} rx=0x{crc_rx:08X} seq={seq} plen={plen}")
-        # dump first bytes for inspection
-        print(f"[PARSE-DBG] raw_start={raw[:32].hex()} ...")
-        # show CRC bytes from packet
-        rx_bytes = raw[HDR_SIZE + plen: HDR_SIZE + plen + 4]
-        print(f"[PARSE-DBG] rx_crc_bytes={rx_bytes.hex()} le=0x{int.from_bytes(rx_bytes,'little'):08X} be=0x{int.from_bytes(rx_bytes,'big'):08X}")
-        # If it's a large frame, allow it through for now (workaround for CRC mismatch)
-        if mtype == MSG_FRAME:
-            print(f"[PARSE-DBG] Warning: accepting MSG_FRAME despite CRC mismatch (seq={seq})")
-            return mtype, seq, ts_us, payload
+        _crc_mismatch_count += 1
+        # Printing per packet can destroy throughput; throttle aggressively.
+        if _crc_mismatch_count <= 5 or (_crc_mismatch_count % 200) == 0:
+            crc_simple = simple_crc32_python(raw[:HDR_SIZE + plen]) & 0xFFFFFFFF
+            print(
+                f"[PARSE-DBG] crc mismatch #{_crc_mismatch_count}: "
+                f"zlib=0x{crc_zlib:08X} simple=0x{crc_simple:08X} rx=0x{crc_rx:08X} "
+                f"type={mtype} seq={seq} plen={plen}"
+            )
         return None
     return mtype, seq, ts_us, payload
 

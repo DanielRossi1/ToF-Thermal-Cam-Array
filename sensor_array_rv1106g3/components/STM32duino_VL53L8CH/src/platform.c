@@ -22,6 +22,12 @@
 
 #define VL53_I2C_ADDR  0x29
 
+// Larger chunks reduce ioctl() overhead on Linux.
+// 128 bytes is generally safe on i2c-dev; reduce if your controller/camera has issues.
+#ifndef VL53_I2C_CHUNK
+#define VL53_I2C_CHUNK  128u
+#endif
+
 // ── I2C handle ──────────────────────────────────────────────────────────────
 // Stored in platform.handle as a pointer to an int (the fd).
 
@@ -39,8 +45,8 @@ uint8_t VL53L8CH_io_write(void *handle, uint16_t reg,
 
     uint32_t offset = 0;
     while (offset < size) {
-        uint32_t chunk = (size - offset > 32) ? 32 : (size - offset);
-        uint8_t buf[34];
+        uint32_t chunk = (size - offset > VL53_I2C_CHUNK) ? (uint32_t)VL53_I2C_CHUNK : (size - offset);
+        uint8_t buf[VL53_I2C_CHUNK + 2];
         buf[0] = (uint8_t)((reg + offset) >> 8);
         buf[1] = (uint8_t)((reg + offset) & 0xFF);
         memcpy(buf + 2, data + offset, chunk);
@@ -64,7 +70,7 @@ uint8_t VL53L8CH_io_read(void *handle, uint16_t reg,
 
     uint32_t offset = 0;
     while (offset < size) {
-        uint32_t chunk = (size - offset > 32) ? 32 : (size - offset);
+        uint32_t chunk = (size - offset > VL53_I2C_CHUNK) ? (uint32_t)VL53_I2C_CHUNK : (size - offset);
         uint8_t reg_buf[2];
         reg_buf[0] = (uint8_t)((reg + offset) >> 8);
         reg_buf[1] = (uint8_t)((reg + offset) & 0xFF);

@@ -36,6 +36,12 @@ typedef struct {
     paramsMLX90640 params;
     uint8_t        addr;
     MlxSettings    settings;
+
+    // Persistent frame buffer: MLX90640 delivers interleaved/chess subpages.
+    // Keep the last computed full frame and only report a new output when we've
+    // observed both subpages at least once.
+    float          frame_f[MLX_PIXELS];
+    uint8_t        got_subpage[2];
 } Mlx90640Driver;
 
 int  mlx_begin(Mlx90640Driver *d);

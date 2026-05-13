@@ -3,3 +3,4 @@ pyqtgraph>=0.13
 pyserial>=3.5
 numpy>=1.21
 Pillow>=9.0
+opencv-contrib-python>=4.8

@@ -6,9 +6,21 @@
 #include <time.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/videodev2.h>
+
+static struct timespec mono_deadline_ms(uint32_t timeout_ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ts.tv_nsec += (long)timeout_ms * 1000000L;
+    while (ts.tv_nsec >= 1000000000L) {
+        ts.tv_nsec -= 1000000000L;
+        ts.tv_sec += 1;
+    }
+    return ts;
+}
 
 static void *capture_thread(void *arg) {
     V4L2Camera *cam = (V4L2Camera *)arg;
@@ -16,13 +28,18 @@ static void *capture_thread(void *arg) {
     while (cam->running) {
         if (cam->fd < 0) { usleep(10000); continue; }
 
+        struct pollfd pfd = { .fd = cam->fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 100);
+        if (pr <= 0) continue;
+        if (!(pfd.revents & POLLIN)) continue;
+
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));
         buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
 
         if (ioctl(cam->fd, VIDIOC_DQBUF, &buf) < 0) {
-            usleep(5000);
+            if (errno == EAGAIN) continue;
             continue;
         }
 
@@ -40,6 +57,8 @@ static void *capture_thread(void *arg) {
             clock_gettime(CLOCK_MONOTONIC, &ts);
             cam->frame_ts_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
             cam->frame_ready = 1;
+            cam->frame_gen++;
+            pthread_cond_broadcast(&cam->cond);
             pthread_mutex_unlock(&cam->mutex);
         }
 
@@ -52,9 +71,18 @@ int v4l2_camera_init(V4L2Camera *cam) {
     memset(cam, 0, sizeof(*cam));
     cam->fd = -1;
     pthread_mutex_init(&cam->mutex, NULL);
-    cam->settings.w = 320;
-    cam->settings.h = 240;
-    cam->settings.interval_us = 83333;
+
+    {
+        pthread_condattr_t attr;
+        pthread_condattr_init(&attr);
+        pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+        pthread_cond_init(&cam->cond, &attr);
+        pthread_condattr_destroy(&attr);
+    }
+
+    cam->settings.w = UVC_DEFAULT_W;
+    cam->settings.h = UVC_DEFAULT_H;
+    cam->settings.interval_us = UVC_DEFAULT_INTERVAL_US;
 
     cam->frame_buf = (uint8_t *)malloc(CAM_JPEG_MAX);
     if (!cam->frame_buf) return -1;
@@ -64,7 +92,7 @@ int v4l2_camera_init(V4L2Camera *cam) {
 int v4l2_camera_start(V4L2Camera *cam, uint32_t w, uint32_t h) {
     if (cam->started) return 0;
 
-    int fd = open("/dev/video0", O_RDWR);
+    int fd = open(UVC_DEVICE_PATH, O_RDWR | O_NONBLOCK);
     if (fd < 0) { perror("v4l2 open"); return -1; }
     cam->fd = fd;
 
@@ -100,6 +128,20 @@ int v4l2_camera_start(V4L2Camera *cam, uint32_t w, uint32_t h) {
     }
     cam->w = fmt.fmt.pix.width;
     cam->h = fmt.fmt.pix.height;
+
+    // Apply frame interval (best-effort; depends on the UVC driver/camera)
+    struct v4l2_streamparm parm;
+    memset(&parm, 0, sizeof(parm));
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    parm.parm.capture.timeperframe.numerator = cam->settings.interval_us;
+    parm.parm.capture.timeperframe.denominator = 1000000;
+    if (ioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
+        perror("VIDIOC_S_PARM");
+    } else {
+        fprintf(stderr, "[V4L2] timeperframe=%u/%u\n",
+                parm.parm.capture.timeperframe.numerator,
+                parm.parm.capture.timeperframe.denominator);
+    }
 
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
@@ -158,7 +200,10 @@ fail:
 void v4l2_camera_stop(V4L2Camera *cam) {
     if (!cam->started) return;
 
+    pthread_mutex_lock(&cam->mutex);
     cam->running = 0;
+    pthread_cond_broadcast(&cam->cond);
+    pthread_mutex_unlock(&cam->mutex);
     pthread_join(cam->thread, NULL);
 
     if (cam->fd >= 0) {
@@ -183,6 +228,7 @@ void v4l2_camera_deinit(V4L2Camera *cam) {
     v4l2_camera_stop(cam);
     free(cam->frame_buf);
     cam->frame_buf = NULL;
+    pthread_cond_destroy(&cam->cond);
     pthread_mutex_destroy(&cam->mutex);
 }
 
@@ -195,12 +241,6 @@ int v4l2_camera_snapshot(V4L2Camera *cam, uint8_t *dst, uint32_t dst_cap,
     *out_len = 0;
     *out_ts_us = 0;
     if (!cam->started || !dst || !dst_cap) return 0;
-                    static uint32_t frame_dbg_count = 0;
-                    if ((frame_dbg_count++ & 0x1F) == 0) {
-                        fprintf(stderr, "[V4L2] frame dbg=%u bytes=%u ts_us=%llu\n",
-                                frame_dbg_count, (unsigned)cam->frame_len, (unsigned long long)cam->frame_ts_us);
-                    }
-
     pthread_mutex_lock(&cam->mutex);
     if (!cam->frame_ready || cam->frame_len == 0) {
         pthread_mutex_unlock(&cam->mutex);
@@ -213,6 +253,55 @@ int v4l2_camera_snapshot(V4L2Camera *cam, uint8_t *dst, uint32_t dst_cap,
     *out_len    = n;
     *out_ts_us  = cam->frame_ts_us;
     cam->frame_ready = 0;  // consumed
+    pthread_mutex_unlock(&cam->mutex);
+    return 1;
+}
+
+int v4l2_camera_snapshot_wait(V4L2Camera *cam, uint8_t *dst, uint32_t dst_cap,
+                              uint32_t *out_len, uint64_t *out_ts_us,
+                              uint64_t min_ts_us, uint32_t timeout_ms) {
+    *out_len = 0;
+    *out_ts_us = 0;
+    if (!cam || !cam->started || !dst || !dst_cap) return 0;
+
+    pthread_mutex_lock(&cam->mutex);
+
+    // If caller doesn't care about timestamp alignment, just grab what's available.
+    if (min_ts_us == 0 || timeout_ms == 0) {
+        uint32_t n = cam->frame_len;
+        if (cam->frame_ready && n > 0) {
+            if (n > dst_cap) n = dst_cap;
+            memcpy(dst, cam->frame_buf, n);
+            *out_len   = n;
+            *out_ts_us = cam->frame_ts_us;
+            cam->frame_ready = 0;
+            pthread_mutex_unlock(&cam->mutex);
+            return 1;
+        }
+        pthread_mutex_unlock(&cam->mutex);
+        return 0;
+    }
+
+    const struct timespec deadline = mono_deadline_ms(timeout_ms);
+    while (cam->started) {
+        if (cam->frame_ready && cam->frame_len > 0 && cam->frame_ts_us >= min_ts_us) break;
+
+        int rc = pthread_cond_timedwait(&cam->cond, &cam->mutex, &deadline);
+        if (rc == ETIMEDOUT) break;
+    }
+
+    // On timeout, return the latest frame if we have one (even if it's older than min_ts_us).
+    if (!cam->frame_ready || cam->frame_len == 0) {
+        pthread_mutex_unlock(&cam->mutex);
+        return 0;
+    }
+
+    uint32_t n = cam->frame_len;
+    if (n > dst_cap) n = dst_cap;
+    memcpy(dst, cam->frame_buf, n);
+    *out_len   = n;
+    *out_ts_us = cam->frame_ts_us;
+    cam->frame_ready = 0;
     pthread_mutex_unlock(&cam->mutex);
     return 1;
 }

@@ -305,14 +305,22 @@ static void handle_cmd_text(Transport *tx, uint32_t seq, char *cmd) {
             if (want_disable) {
                 v4l2_camera_stop(g_ctx->cam);
                 if (g_ctx->cam_started) *g_ctx->cam_started = 0;
+                transport_send_text_resp(tx, seq, "OK\n");
+                return;
             }
+
+            // Store/apply settings (restarts stream if already running)
+            int apply_rc = v4l2_camera_apply_settings(g_ctx->cam, &s);
+
             if (want_enable) {
-                int ok = v4l2_camera_start(g_ctx->cam, s.w, s.h);
+                int already = (g_ctx->cam_started && *g_ctx->cam_started);
+                int ok = (apply_rc == 0) && (already ? 1 : (v4l2_camera_start(g_ctx->cam, s.w, s.h) == 0));
                 if (g_ctx->cam_started) *g_ctx->cam_started = ok;
                 transport_send_text_resp(tx, seq, ok ? "OK\n" : "ERR cam start\n");
-            } else {
-                transport_send_text_resp(tx, seq, "OK\n");
+                return;
             }
+
+            transport_send_text_resp(tx, seq, "OK\n");
             return;
         }
 #endif

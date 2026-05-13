@@ -198,6 +198,9 @@ cython_debug/
 #   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
 #   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
 #   and can be added to the global gitignore or merged into this file. However, if you prefer, 
+
+# Local toolchain cache
+sensor_array_rv1106g3/.toolchain/
 #   you could uncomment the following to ignore the entire vscode folder
 # .vscode/
 # Temporary file for partial code execution
@@ -222,3 +225,4 @@ sensor_array_idf/build
 sensor_array_idf/managed_components/espressif__cmake_utilities
 sensor_array_idf/managed_components/espressif__usb_stream
 esp/esp-idf
+sensor_array_idf/components/Adafruit_MLX90640/Adafruit_BusIO
