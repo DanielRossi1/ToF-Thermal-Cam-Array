@@ -1,11 +1,11 @@
 #pragma once
 
 #include <stdint.h>
+#include <pthread.h>
 #include "hub_frame.h"
 #include "i2c_bus.h"
 #include "MLX90640_API.h"
 
-// Refresh rate enum values
 #define MLX90640_0_5_HZ  0
 #define MLX90640_1_HZ    1
 #define MLX90640_2_HZ    2
@@ -15,13 +15,11 @@
 #define MLX90640_32_HZ   6
 #define MLX90640_64_HZ   7
 
-// ADC resolution codes
 #define MLX90640_ADC_16BIT 0
 #define MLX90640_ADC_17BIT 1
 #define MLX90640_ADC_18BIT 2
 #define MLX90640_ADC_19BIT 3
 
-// Measurement mode codes
 #define MLX90640_CHESS       1
 #define MLX90640_INTERLEAVED 0
 
@@ -32,19 +30,30 @@ typedef struct {
 } MlxSettings;
 
 typedef struct {
-    I2CBus      *bus;
-    paramsMLX90640 params;
-    uint8_t        addr;
-    MlxSettings    settings;
+    I2CBus         *bus;
+    paramsMLX90640  params;
+    uint8_t         addr;
+    MlxSettings     settings;
 
-    // Persistent frame buffer: MLX90640 delivers interleaved/chess subpages.
-    // Keep the last computed full frame and only report a new output when we've
-    // observed both subpages at least once.
-    float          frame_f[MLX_PIXELS];
-    uint8_t        got_subpage[2];
+    // Background capture thread
+    pthread_t       thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+    int             running;
+
+    // Published frame (written by thread, consumed by loop_thread)
+    MlxDataV1       latest;
+    int             frame_ready;
+    uint32_t        frame_gen;
+
+    // Internal accumulation across subpages
+    float           frame_f[MLX_PIXELS];
+    uint8_t         got_subpage[2];
 } Mlx90640Driver;
 
 int  mlx_begin(Mlx90640Driver *d);
-int  mlx_read_frame(Mlx90640Driver *d, MlxDataV1 *out);
+int  mlx_start_thread(Mlx90640Driver *d);
+void mlx_stop_thread(Mlx90640Driver *d);
+int  mlx_consume(Mlx90640Driver *d, MlxDataV1 *out);  // called from loop_thread
 void mlx_get_settings(Mlx90640Driver *d, MlxSettings *s);
 int  mlx_apply_settings(Mlx90640Driver *d, const MlxSettings *s);

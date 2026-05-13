@@ -197,6 +197,10 @@ static void *tx_thread(void *arg) {
         g_tx_has_frame = 0;
         pthread_mutex_unlock(&g_tx_mutex);
 
+        // If the client socket write blocks for too long it's better to drop
+        // frames on the wire rather than block the capture pipeline. The
+        // transport layer already uses non-blocking sockets and retries on
+        // EAGAIN; keep that behavior but limit excessive sleep here.
         transport_send(&g_tx, MSG_FRAME, seq, ts, payload, plen);
         
         tx_count++;
@@ -329,10 +333,32 @@ static void *loop_thread(void *arg) {
         }
 
         if ((mode == STREAM_MODE_ALL || mode == STREAM_MODE_MLX_ONLY) && g_mlx_ok) {
-            if (mlx_read_frame(&g_mlx, &fb->fixed.mlx))
+            if (mlx_consume(&g_mlx, &fb->fixed.mlx))
                 fb->fixed.flags |= FLAG_MLX_VALID;
             else if (g_frame_seq % 100 == 0)
                 fprintf(stderr, "WARN: MLX read returned no data (frame %u)\n", g_frame_seq);
+        }
+        if ((fb->fixed.flags & FLAG_MLX_VALID) && g_cam_started) {
+            int max_temp = 0;
+            int hot_x = 16, hot_y = 12; // MLX center
+
+            // Find the hottest pixel in the 32x24 array
+            for (int i = 0; i < MLX_PIXELS; i++) {
+                if (fb->fixed.mlx.frame_cC[i] > max_temp) {
+                    max_temp = fb->fixed.mlx.frame_cC[i];
+                    hot_x = i % 32;
+                    hot_y = i / 32;
+                }
+            }
+
+            // If hotter than 28°C (2800 cC), tell the camera to focus AE on this area
+            if (max_temp > 2800) {
+                g_cam.roi_x = (float)hot_x / 32.0f;
+                g_cam.roi_y = (float)hot_y / 24.0f;
+                g_cam.roi_w = 0.8f; // 80% weight to the person/heat source
+            } else {
+                g_cam.roi_w = 0.0f; // Return to global average
+            }
         }
 
         cam_sync_fill(&g_cam_sync, &fb->fixed.cam_sync);
@@ -588,6 +614,12 @@ int main(void) {
     printf("Initializing MLX sensor...\n");
     g_mlx.bus = &g_i2c;
     g_mlx_ok  = (mlx_begin(&g_mlx) == 0);
+    if (g_mlx_ok) {
+        if (mlx_start_thread(&g_mlx) != 0) {
+            fprintf(stderr, "WARN: MLX thread failed to start\n");
+            g_mlx_ok = 0;
+        }
+    }
     printf("MLX sensor: %s\n", g_mlx_ok ? "OK" : "FAILED");
 
     // ── Camera sync ────────────────────────────────────────────────────────

@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include "hub_config.h"
+#include "fast_aec.h"
 
 #define V4L2_NB_BUFFERS  4
 
@@ -10,6 +11,9 @@ typedef struct {
     uint32_t w;
     uint32_t h;
     uint32_t interval_us;
+    int32_t  exposure_abs;   // V4L2_CID_EXPOSURE_ABSOLUTE in 100 µs units
+                             // used only when aperture-priority fails
+                             // 166 = ~16 ms, 333 = ~33 ms, 0 = let driver pick
 } UvcSettings;
 
 typedef struct {
@@ -31,7 +35,15 @@ typedef struct {
     uint32_t        frame_gen;
 
     uint32_t        w, h;
+    uint32_t        pixfmt;        // negotiated V4L2_PIX_FMT_*
     UvcSettings     settings;
+    int32_t         aec_target;     // target brightness 0-255
+    int32_t         aec_enabled;
+    
+    FastAecContext  aec_ctx;
+    float           roi_x;
+    float           roi_y;
+    float           roi_w;
 } V4L2Camera;
 
 int  v4l2_camera_init(V4L2Camera *cam);

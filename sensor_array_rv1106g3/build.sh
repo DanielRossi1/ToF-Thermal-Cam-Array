@@ -90,6 +90,60 @@ if ! command -v "${CROSS_COMPILE}gcc" &>/dev/null; then
 fi
 echo "Compiler: $(${CROSS_COMPILE}gcc --version | head -1)"
 
+# =========================================================================
+# AUTO-BUILD LIBJPEG-TURBO FOR ARM
+# =========================================================================
+LIBJPEG_DIR="$PROJECT_DIR/libs_arm"
+if [ ! -f "$LIBJPEG_DIR/lib/libturbojpeg.a" ]; then
+    echo ""
+    echo "========================================"
+    echo " Auto-building libjpeg-turbo for ARM... "
+    echo "========================================"
+    
+    if ! command -v cmake &>/dev/null; then
+        echo "ERROR: 'cmake' is required to build libjpeg-turbo." >&2
+        echo "Please run: sudo apt-get install cmake" >&2
+        exit 1
+    fi
+
+    JPEG_SRC_DIR="$TOOLCHAIN_CACHE_DIR/libjpeg-turbo-src"
+    mkdir -p "$JPEG_SRC_DIR"
+    
+    if [ ! -f "$JPEG_SRC_DIR/CMakeLists.txt" ]; then
+        echo "Downloading libjpeg-turbo 3.0.3..."
+        JPEG_URL="https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/3.0.3.tar.gz"
+        if command -v curl &>/dev/null; then
+            curl -fL "$JPEG_URL" | tar -xz -C "$JPEG_SRC_DIR" --strip-components=1
+        elif command -v wget &>/dev/null; then
+            wget -qO- "$JPEG_URL" | tar -xz -C "$JPEG_SRC_DIR" --strip-components=1
+        else
+            echo "ERROR: curl or wget required." >&2; exit 1
+        fi
+    fi
+
+    echo "Configuring and compiling libjpeg-turbo..."
+    mkdir -p "$JPEG_SRC_DIR/build"
+    cd "$JPEG_SRC_DIR/build"
+    
+    # We compile STATIC ONLY so you don't have to push .so files to the Pico
+    cmake -G"Unix Makefiles" \
+        -DCMAKE_C_COMPILER="$(command -v ${CROSS_COMPILE}gcc)" \
+        -DCMAKE_SYSTEM_NAME=Linux \
+        -DCMAKE_SYSTEM_PROCESSOR=arm \
+        -DCMAKE_INSTALL_PREFIX="$LIBJPEG_DIR" \
+        -DENABLE_SHARED=OFF \
+        -DENABLE_STATIC=ON \
+        ..
+        
+    make -j"$(nproc)"
+    make install
+    cd "$PROJECT_DIR"
+    echo "libjpeg-turbo successfully built and installed to $LIBJPEG_DIR"
+    echo "========================================"
+    echo ""
+fi
+# =========================================================================
+
 USE_TCP="${USE_TCP:-0}"
 USE_CAM="${USE_CAM:-0}"
 USE_CAM_SYNC="${USE_CAM_SYNC:-0}"

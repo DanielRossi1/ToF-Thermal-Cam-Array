@@ -26,7 +26,8 @@ MAIN_SRCS = \
 	$(SRCDIR)/tof_vl53l8ch.c    \
 	$(SRCDIR)/mlx90640_driver.c \
 	$(SRCDIR)/camera_sync.c     \
-	$(SRCDIR)/v4l2_camera.c
+	$(SRCDIR)/v4l2_camera.c		\
+    $(SRCDIR)/fast_aec.c
 
 VL53_SRCS = \
 	$(VL53SRCDIR)/platform.c                             \
@@ -49,11 +50,12 @@ CFLAGS += -I$(SRCDIR)
 CFLAGS += -I$(VL53SRCDIR)
 CFLAGS += -Icomponents/STM32duino_VL53L8CH
 CFLAGS += -I$(MLXSRCDIR)
+CFLAGS += -I./libs_arm/include
 CFLAGS += -D_GNU_SOURCE
 CFLAGS += $(FEATURE_FLAGS)
 
 LDFLAGS = -static
-LIBS    = -lpthread -lm -lrt
+LIBS    = -lpthread -lm -lrt ./libs_arm/lib/libturbojpeg.a
 
 .PHONY: all clean
 

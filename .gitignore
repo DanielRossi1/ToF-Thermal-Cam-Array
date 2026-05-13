@@ -226,3 +226,4 @@ sensor_array_idf/managed_components/espressif__cmake_utilities
 sensor_array_idf/managed_components/espressif__usb_stream
 esp/esp-idf
 sensor_array_idf/components/Adafruit_MLX90640/Adafruit_BusIO
+sensor_array_rv1106g3/libs_arm/
