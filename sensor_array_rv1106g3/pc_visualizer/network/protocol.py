@@ -13,6 +13,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
 
+from config.defaults import (
+    TOF_ZONES, TOF_TPZ,
+    MLX_W, MLX_H
+)
+
+
 # Simple CRC32 matching C implementation
 _crc_table = (
     0x00000000,0x77073096,0xEE0E612C,0x990951BA,0x076DC419,0x706AF48F,
@@ -81,9 +87,6 @@ MSG_RESP  = 3
 MSG_EVENT = 4
 
 # Sensor layout
-TOF_ZONES    = 64
-TOF_TPZ      = 4   # targets per zone
-MLX_W, MLX_H = 32, 24
 MLX_PIXELS   = MLX_W * MLX_H
 
 # Frame flags
@@ -196,17 +199,27 @@ class SlipDecoder:
         self._esc = False
 
     def feed(self, data: bytes):
-        for b in data:
-            if b == SLIP_END:
-                if self._buf:
-                    self._cb(bytes(self._buf))
-                self._buf.clear()
-                self._esc = False
-            elif self._esc:
+        arr = np.frombuffer(data, dtype=np.uint8)
+        ends = np.where(arr == SLIP_END)[0]
+        prev = 0
+        for end in ends:
+            chunk = arr[prev:end]
+            # only loop escape sequences within chunk (rare)
+            self._feed_chunk(chunk)
+            if self._buf:
+                self._cb(bytes(self._buf))
+            self._buf.clear()
+            self._esc = False
+            prev = end + 1
+        # tail after last END
+        self._feed_chunk(arr[prev:])
+
+    def _feed_chunk(self, chunk: np.ndarray):
+        for b in chunk.tolist():   # .tolist() is faster than iterating np scalars
+            if self._esc:
                 self._esc = False
                 if   b == SLIP_ESC_END: self._buf.append(SLIP_END)
                 elif b == SLIP_ESC_ESC: self._buf.append(SLIP_ESC)
-                # else: invalid — drop
             elif b == SLIP_ESC:
                 self._esc = True
             else:
