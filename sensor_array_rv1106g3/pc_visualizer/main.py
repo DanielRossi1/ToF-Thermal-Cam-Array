@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
-import sys, argparse
+import sys, argparse, os
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QApplication, 
 )
@@ -32,6 +33,9 @@ def main():
     pg.setConfigOption('foreground', '#d0d0d0')
     pg.setConfigOption('antialias',  True)
 
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
 

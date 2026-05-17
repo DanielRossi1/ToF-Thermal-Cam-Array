@@ -10,6 +10,7 @@ Graphics   : HistogramLUT colour editors, colormap pickers, FPS sparkline,
 import os, time, queue
 import numpy as np
 
+from PyQt5.QtWidgets import QDesktopWidget 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QComboBox, QLineEdit,
@@ -28,6 +29,9 @@ from network.protocol import (
     MLX_W, MLX_H,
 )
 
+from combined_view.overlapped_page import OverlapPage
+import json
+
 from network.network import NetworkWorker
 from widgets.ToF_widget import TofWidget
 from widgets.thermal_widget import ThermalWidget
@@ -44,8 +48,9 @@ class MainWindow(QMainWindow):
                  port: int  = DEFAULT_PORT,
                  proto: str = DEFAULT_PROTO):
         super().__init__()
-        self.setWindowTitle('Sensor Hub Visualizer  v2')
-        self.resize(1550, 980)
+        self.setWindowTitle('Sensor Hub Visualizer')
+        self.setMinimumSize(800, 600) 
+        self.resize(1200, 800)
 
         self._worker = NetworkWorker()
         self._thread = QThread()
@@ -167,8 +172,10 @@ class MainWindow(QMainWindow):
         sg.setColumnStretch(3, 1)
 
         self._calib_page = CalibrationPage()
+        self._overlap_page = OverlapPage()
         self._config_page = ConfigPage()
         self._tabs.addTab(live, "Live")
+        self._tabs.addTab(self._overlap_page, "Overlap View")
         self._tabs.addTab(self._calib_page, "Calibration")
         self._tabs.addTab(self._config_page, "Config")
 
@@ -258,7 +265,16 @@ class MainWindow(QMainWindow):
         rl.addWidget(self._console, stretch=1)
 
         split.addWidget(rw)
-        split.setSizes([1200, 340])
+        
+        # 1. Override any hidden minimum sizes in your imported widgets
+        self._cam_w.setMinimumSize(50, 50)
+        self._tof_w.setMinimumSize(50, 50)
+        self._mlx_w.setMinimumSize(50, 50)
+        self._stat_w.setMinimumSize(50, 50)
+
+        # 2. Use proportional stretching instead of rigid pixel counts
+        split.setStretchFactor(0, 3) # Left side gets 75%
+        split.setStretchFactor(1, 1) # Right side gets 25%
 
     # ── Persistent config ───────────────────────────────────────────────────
 
@@ -293,6 +309,16 @@ class MainWindow(QMainWindow):
             cfg[f'{p}_flip_x'] = s.value(f'view/{p}_flip_x', cfg[f'{p}_flip_x'], type=bool)
             cfg[f'{p}_flip_y'] = s.value(f'view/{p}_flip_y', cfg[f'{p}_flip_y'], type=bool)
 
+        try:
+            if s.contains('calib/camera_matrix'):
+                cfg['camera_matrix'] = json.loads(s.value('calib/camera_matrix', type=str))
+                cfg['dist_coeffs'] = json.loads(s.value('calib/dist_coeffs', type=str))
+            if s.contains('calib/R_tof_to_rgb'):
+                cfg['R_tof_to_rgb'] = json.loads(s.value('calib/R_tof_to_rgb', type=str))
+                cfg['t_tof_to_rgb'] = json.loads(s.value('calib/t_tof_to_rgb', type=str))
+        except Exception as e:
+            print(f"Could not parse persisted calibration JSON: {e}")
+
         self._apply_config(cfg)
         self._config_page.set_config(cfg)
 
@@ -311,6 +337,9 @@ class MainWindow(QMainWindow):
         self._mlx_w.set_transform(cfg.get('mlx_rot', 0), cfg.get('mlx_flip_x', False), cfg.get('mlx_flip_y', False))
         self._cam_w.set_transform(cfg.get('cam_rot', 0), cfg.get('cam_flip_x', False), cfg.get('cam_flip_y', False))
 
+        if hasattr(self, '_overlap_page'):
+            self._overlap_page.set_calibration(cfg)
+
         # Keep Config tab in sync
         if hasattr(self, '_config_page') and self._config_page is not None:
             self._config_page.set_config(cfg)
@@ -326,6 +355,13 @@ class MainWindow(QMainWindow):
             s.setValue(f'view/{p}_rot', int(cfg.get(f'{p}_rot', 0)))
             s.setValue(f'view/{p}_flip_x', bool(cfg.get(f'{p}_flip_x', False)))
             s.setValue(f'view/{p}_flip_y', bool(cfg.get(f'{p}_flip_y', False)))
+            
+        if 'camera_matrix' in cfg:
+            s.setValue('calib/camera_matrix', json.dumps(cfg['camera_matrix']))
+            s.setValue('calib/dist_coeffs', json.dumps(cfg['dist_coeffs']))
+            if 'R_tof_to_rgb' in cfg:
+                s.setValue('calib/R_tof_to_rgb', json.dumps(cfg['R_tof_to_rgb']))
+                s.setValue('calib/t_tof_to_rgb', json.dumps(cfg['t_tof_to_rgb']))
 
         s.sync()
         self._apply_config(cfg)
@@ -409,8 +445,13 @@ class MainWindow(QMainWindow):
         if sf.cam_jpeg: self._cam_w.update_frame(
             sf.cam_jpeg, sf.cam_w, sf.cam_h, sf.cam_ts_us)
         self._stat_w.update(sf)
+        
         if hasattr(self, '_calib_page') and self._calib_page is not None:
             self._calib_page.update_from_synced_frame(sf)
+            
+        # Add this line to feed frames to the new overlap page:
+        if hasattr(self, '_overlap_page') and self._overlap_page is not None:
+            self._overlap_page.update_from_synced_frame(sf)
 
     # ── Recording ──────────────────────────────────────────────────────────────
 
