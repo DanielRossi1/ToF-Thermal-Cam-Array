@@ -246,10 +246,35 @@ class ConfigPage(QWidget):
         fx_cy_row.addStretch()
         calib_l.addLayout(fx_cy_row)
 
+        # Camera model
+        cm_row = QHBoxLayout()
+        cm_row.setSpacing(8)
+        cm_row.addWidget(QLabel("Camera model"))
+        self._cam_model = QComboBox()
+        self._cam_model.addItems(["Pinhole", "Fisheye"])
+        self._cam_model.setCurrentText("Pinhole")
+        cm_row.addWidget(self._cam_model)
+        cm_row.addStretch()
+        calib_l.addLayout(cm_row)
+
         # Distortion
-        calib_l.addWidget(_section_label("DISTORTION  (k1  k2  p1  p2  k3)"))
-        self._dist = VectorEdit(5, ["k1", "k2", "p1", "p2", "k3"])
-        calib_l.addWidget(self._dist)
+        self._dist_lbl = _section_label("DISTORTION  (k1  k2  p1  p2  k3)")
+        calib_l.addWidget(self._dist_lbl)
+        self._dist_pinhole = VectorEdit(5, ["k1", "k2", "p1", "p2", "k3"])
+        self._dist_fisheye = VectorEdit(4, ["k1", "k2", "k3", "k4"])
+        calib_l.addWidget(self._dist_pinhole)
+        calib_l.addWidget(self._dist_fisheye)
+        self._dist_fisheye.setVisible(False)
+
+        def _on_cam_model_changed():
+            is_fish = self._cam_model.currentText().startswith("Fish")
+            self._dist_pinhole.setVisible(not is_fish)
+            self._dist_fisheye.setVisible(is_fish)
+            self._dist_lbl.setText(
+                "DISTORTION  (k1  k2  k3  k4)" if is_fish else "DISTORTION  (k1  k2  p1  p2  k3)"
+            )
+
+        self._cam_model.currentIndexChanged.connect(_on_cam_model_changed)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.HLine)
@@ -350,6 +375,14 @@ class ConfigPage(QWidget):
                 R    = data.get("R_tof_to_rgb"),
                 t    = data.get("t_tof_to_rgb"),
             )
+            # Camera model: prefer explicit key, else infer from dist length.
+            try:
+                cm = data.get("camera_model")
+                if cm is not None:
+                    cm_val = int(np.asarray(cm).flatten()[0])
+                    self._cam_model.setCurrentText("Fisheye" if cm_val == 1 else "Pinhole")
+            except Exception:
+                pass
             tof_fov = data.get("tof_fov_deg")
             if tof_fov is not None:
                 try:
@@ -376,7 +409,14 @@ class ConfigPage(QWidget):
             self._cx.setText(f"{K[0, 2]:.6g}")
             self._cy.setText(f"{K[1, 2]:.6g}")
         if dist is not None:
-            self._dist.set_vector(np.asarray(dist).flatten()[:5])
+            d = np.asarray(dist, dtype=float).flatten()
+            # If it looks like a fisheye vector (4 coeffs), switch the UI.
+            if d.size == 4:
+                self._cam_model.setCurrentText("Fisheye")
+                self._dist_fisheye.set_vector(d[:4])
+            else:
+                self._cam_model.setCurrentText("Pinhole")
+                self._dist_pinhole.set_vector(d[:5])
         if R is not None:
             self._R_edit.set_matrix(np.asarray(R, dtype=float).reshape(3, 3))
         if t is not None:
@@ -385,18 +425,29 @@ class ConfigPage(QWidget):
     # ── Validation ────────────────────────────────────────────────────────────
 
     def _validate_calib(self):
-        """Check R is orthogonal; show coloured status."""
+        """Check R is orthogonal and t is plausible; show coloured status."""
         R = self._R_edit.get_matrix()
+        t = self._t_edit.get_vector()
         det = np.linalg.det(R)
         err = np.linalg.norm(R.T @ R - np.eye(3))
-        if abs(det - 1.0) < 0.01 and err < 0.01:
-            self._calib_valid.setText(f"✓ R is valid rotation  (det={det:.4f})")
-            self._calib_valid.setStyleSheet(f"color:{_GOOD}; font-size:10px;")
-        else:
-            self._calib_valid.setText(
-                f"⚠  R may not be a pure rotation  (det={det:.4f}, RᵀR err={err:.4f})"
-            )
-            self._calib_valid.setStyleSheet(f"color:{_WARN}; font-size:10px;")
+
+        rot_ok = (abs(det - 1.0) < 0.01 and err < 0.01)
+        msg = (
+            f"✓ R is valid rotation  (det={det:.4f})"
+            if rot_ok else
+            f"⚠  R may not be a pure rotation  (det={det:.4f}, RᵀR err={err:.4f})"
+        )
+
+        # Heuristic: warn if |t| is very large.
+        try:
+            t_norm_mm = float(np.linalg.norm(np.asarray(t, dtype=float).reshape(-1)[:3])) * 1000.0
+        except Exception:
+            t_norm_mm = 0.0
+        if t_norm_mm > 500.0:
+            msg += f"\n⚠  |t| is large: {t_norm_mm:.0f} mm (check ToF flip/orientation and near-range bias)"
+
+        self._calib_valid.setText(msg)
+        self._calib_valid.setStyleSheet(f"color:{_GOOD if rot_ok and t_norm_mm <= 500.0 else _WARN}; font-size:10px;")
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -423,6 +474,14 @@ class ConfigPage(QWidget):
                 R    = np.array(R)    if R    is not None else None,
                 t    = np.array(t)    if t    is not None else None,
             )
+            try:
+                cm = str(cfg.get('camera_model', '')).strip().lower()
+                if cm == 'fisheye':
+                    self._cam_model.setCurrentText('Fisheye')
+                elif cm:
+                    self._cam_model.setCurrentText('Pinhole')
+            except Exception:
+                pass
             self._calib_info.setText("Calibration loaded from config.")
             self._calib_info.setStyleSheet(f"color:{_GOOD}; font-size:10px;")
             self._validate_calib()
@@ -461,7 +520,13 @@ class ConfigPage(QWidget):
                           [0, fy, cy],
                           [0,  0,  1]], dtype=float)
             cfg["camera_matrix"] = K.tolist()
-            cfg["dist_coeffs"]   = self._dist.get_vector().tolist()
+
+            is_fish = self._cam_model.currentText().startswith('Fish')
+            cfg["camera_model"] = "fisheye" if is_fish else "pinhole"
+            if is_fish:
+                cfg["dist_coeffs"] = self._dist_fisheye.get_vector().tolist()
+            else:
+                cfg["dist_coeffs"] = self._dist_pinhole.get_vector().tolist()
 
             R = self._R_edit.get_matrix()
             t = self._t_edit.get_vector()

@@ -313,6 +313,8 @@ class MainWindow(QMainWindow):
             if s.contains('calib/camera_matrix'):
                 cfg['camera_matrix'] = json.loads(s.value('calib/camera_matrix', type=str))
                 cfg['dist_coeffs'] = json.loads(s.value('calib/dist_coeffs', type=str))
+                if s.contains('calib/camera_model'):
+                    cfg['camera_model'] = s.value('calib/camera_model', 'pinhole', type=str)
             if s.contains('calib/R_tof_to_rgb'):
                 cfg['R_tof_to_rgb'] = json.loads(s.value('calib/R_tof_to_rgb', type=str))
                 cfg['t_tof_to_rgb'] = json.loads(s.value('calib/t_tof_to_rgb', type=str))
@@ -337,6 +339,9 @@ class MainWindow(QMainWindow):
         self._mlx_w.set_transform(cfg.get('mlx_rot', 0), cfg.get('mlx_flip_x', False), cfg.get('mlx_flip_y', False))
         self._cam_w.set_transform(cfg.get('cam_rot', 0), cfg.get('cam_flip_x', False), cfg.get('cam_flip_y', False))
 
+        if hasattr(self, '_calib_page'):
+            self._calib_page.set_config(cfg)
+
         if hasattr(self, '_overlap_page'):
             self._overlap_page.set_calibration(cfg)
 
@@ -359,6 +364,8 @@ class MainWindow(QMainWindow):
         if 'camera_matrix' in cfg:
             s.setValue('calib/camera_matrix', json.dumps(cfg['camera_matrix']))
             s.setValue('calib/dist_coeffs', json.dumps(cfg['dist_coeffs']))
+            if 'camera_model' in cfg:
+                s.setValue('calib/camera_model', str(cfg.get('camera_model', 'pinhole')))
             if 'R_tof_to_rgb' in cfg:
                 s.setValue('calib/R_tof_to_rgb', json.dumps(cfg['R_tof_to_rgb']))
                 s.setValue('calib/t_tof_to_rgb', json.dumps(cfg['t_tof_to_rgb']))

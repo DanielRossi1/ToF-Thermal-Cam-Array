@@ -10,6 +10,7 @@ Notes
 - Highlights the foreground object (box) using the depth step vs background.
 """
 
+import time
 import numpy as np
 import cv2
 from PyQt5.QtWidgets import (
@@ -36,6 +37,15 @@ class OverlapPage(QWidget):
         self._D = None
         self._R = None
         self._t = None
+        self._camera_model = None  # 'pinhole' | 'fisheye' | None
+
+        self._undist_map1 = None
+        self._undist_map2 = None
+        self._undist_K_new = None
+        self._undist_size = None
+
+        self._last_tof_time_s = None
+        self._tof_stale_ms = 500.0
 
         self._tof_fov_rad = np.radians(45.0)
         self._rays = None  # Precomputed unit rays (zones, 4, 3)
@@ -70,6 +80,10 @@ class OverlapPage(QWidget):
         self._enable_overlay.setChecked(True)
         gb_lay.addWidget(self._enable_overlay)
 
+        self._show_all_zones = QCheckBox("All zones")
+        self._show_all_zones.setChecked(True)
+        gb_lay.addWidget(self._show_all_zones)
+
         gb_lay.addWidget(QLabel("Colormap:"))
         self._cmap_cb = QComboBox()
         self._cmap_cb.addItems(COLORMAPS)
@@ -79,6 +93,10 @@ class OverlapPage(QWidget):
         self._calib_status = QLabel("Calibration: NOT LOADED")
         self._calib_status.setStyleSheet("color: #f44336; font-weight: bold;")
         gb_lay.addWidget(self._calib_status)
+
+        self._tof_age_lbl = QLabel("ToF age: —")
+        self._tof_age_lbl.setStyleSheet("color: #5a6080;")
+        gb_lay.addWidget(self._tof_age_lbl)
 
         gb_lay.addStretch()
         ctrl_lay.addWidget(gb)
@@ -114,6 +132,16 @@ class OverlapPage(QWidget):
                 self._D = np.array(cfg.get('dist_coeffs', np.zeros((1, 5))), dtype=np.float64)
                 self._R = np.array(cfg['R_tof_to_rgb'], dtype=np.float64)
                 self._t = np.array(cfg['t_tof_to_rgb'], dtype=np.float64).flatten()
+                try:
+                    cm = cfg.get('camera_model', None)
+                    self._camera_model = (str(cm).strip().lower() if cm is not None else None)
+                except Exception:
+                    self._camera_model = None
+
+                self._undist_map1 = None
+                self._undist_map2 = None
+                self._undist_K_new = None
+                self._undist_size = None
 
                 # Update FoV and invalidate cached rays so they are recomputed.
                 fov_deg = float(cfg.get('tof_fov_deg', np.degrees(self._tof_fov_rad)))
@@ -174,6 +202,40 @@ class OverlapPage(QWidget):
         if self._tof_flip_y:
             grid = np.fliplr(grid)
         return grid
+
+    def _get_undistort_maps(self, w: int, h: int):
+        """Build or return cached undistortion maps for image size (w, h)."""
+        if self._undist_map1 is not None and self._undist_size == (w, h):
+            return self._undist_map1, self._undist_map2, self._undist_K_new
+
+        model = (self._camera_model or "").lower()
+        d_flat = np.asarray(self._D, dtype=np.float64).reshape(-1)
+        is_fisheye = (model == "fisheye") or (model == "fish") or (d_flat.size == 4)
+
+        if is_fisheye:
+            D4 = d_flat[:4].reshape(4, 1)
+            R = np.eye(3, dtype=np.float64)
+            # balance=0.0 behaves like alpha=0.0 (crop to fill)
+            K_new = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                self._K, D4, (w, h), R, balance=0.0
+            )
+            map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+                self._K, D4, R, K_new, (w, h), cv2.CV_16SC2
+            )
+        else:
+            # alpha=0.0 crops to a normal full-frame view; alpha=1.0 can shrink
+            # valid content to a tiny region for extreme distortion.
+            K_new, _ = cv2.getOptimalNewCameraMatrix(
+                self._K, self._D, (w, h), alpha=0.0
+            )
+            map1, map2 = cv2.initUndistortRectifyMap(
+                self._K, self._D, None, K_new, (w, h), cv2.CV_16SC2
+            )
+        self._undist_map1 = map1
+        self._undist_map2 = map2
+        self._undist_K_new = K_new
+        self._undist_size = (w, h)
+        return map1, map2, K_new
 
     def _precompute_rays(self, resolution: int):
         """Precompute unit-direction rays for each ToF zone corner.
@@ -252,6 +314,22 @@ class OverlapPage(QWidget):
         status = np.asarray(getattr(tof, 'status', None)) if hasattr(tof, 'status') else None
         sigma = np.asarray(getattr(tof, 'sigma_mm', None)) if hasattr(tof, 'sigma_mm') else None
 
+        if dist.ndim == 1:
+            dist_1d = dist.astype(np.float32).reshape(-1)
+            sel_status = None
+            if status is not None:
+                if status.shape == dist.shape:
+                    sel_status = status.astype(np.uint8).reshape(-1)
+                elif status.size == dist_1d.size:
+                    sel_status = status.reshape(-1).astype(np.uint8)
+            sel_sigma = None
+            if sigma is not None:
+                if sigma.shape == dist.shape:
+                    sel_sigma = sigma.astype(np.float32).reshape(-1)
+                elif sigma.size == dist_1d.size:
+                    sel_sigma = sigma.reshape(-1).astype(np.float32)
+            return dist_1d, sel_status, sel_sigma
+
         # Multi-target per zone: (N_zones, N_targets)
         if dist.ndim == 2 and dist.shape[0] != dist.shape[1]:
             n_zones, _ = dist.shape
@@ -278,11 +356,35 @@ class OverlapPage(QWidget):
         if not sf.cam_jpeg:
             return
 
+        now = time.monotonic()
+        if sf.tof is not None:
+            self._last_tof_time_s = now
+
+        age_ms = None
+        if self._last_tof_time_s is not None:
+            age_ms = (now - self._last_tof_time_s) * 1000.0
+            self._tof_age_lbl.setText(f"ToF age: {age_ms:.0f} ms")
+            if age_ms > self._tof_stale_ms:
+                self._tof_age_lbl.setStyleSheet("color: #ff9800;")
+            else:
+                self._tof_age_lbl.setStyleSheet("color: #90caf9;")
+        else:
+            self._tof_age_lbl.setText("ToF age: —")
+            self._tof_age_lbl.setStyleSheet("color: #5a6080;")
+
         arr = np.frombuffer(sf.cam_jpeg, dtype=np.uint8)
         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if bgr is None:
             return
 
+        if self._K is not None and self._D is not None:
+            h_img, w_img = bgr.shape[:2]
+            map1, map2, K_new = self._get_undistort_maps(w_img, h_img)
+            bgr = cv2.remap(bgr, map1, map2, cv2.INTER_LINEAR)
+        else:
+            K_new = None
+
+        overlay_drawn = False
         if (
             self._enable_overlay.isChecked()
             and sf.tof is not None
@@ -335,7 +437,10 @@ class OverlapPage(QWidget):
                     fg0 &= np.isin(status_grid, list(self._valid_tof_status))
 
                 fg = self._largest_component(fg0, delta)
-                draw_mask = fg.reshape(-1) if (fg is not None and fg.sum() >= 2) else valid_mask
+                if self._show_all_zones.isChecked():
+                    draw_mask = valid_mask
+                else:
+                    draw_mask = fg.reshape(-1) if (fg is not None and fg.sum() >= 2) else valid_mask
 
                 dist_draw = dist_mm[draw_mask]
                 d_m = (dist_draw / 1000.0).reshape(-1, 1, 1)
@@ -343,14 +448,16 @@ class OverlapPage(QWidget):
 
                 pts_cam = (self._R @ P_tof.reshape(-1, 3).T).T + self._t
 
+                proj_K = K_new if K_new is not None else self._K
                 pts_2d, _ = cv2.projectPoints(
                     pts_cam.reshape(-1, 1, 3).astype(np.float64),
                     np.zeros((3, 1)),
                     np.zeros((3, 1)),
-                    self._K,
-                    self._D,
+                    proj_K,
+                    np.zeros((1, 5)),
                 )
                 polygons = pts_2d.reshape(-1, 4, 2).astype(np.int32)
+                overlay_drawn = True
 
                 # Auto-scale colormap for readability
                 d_m_valid = dist_draw / 1000.0
@@ -383,6 +490,29 @@ class OverlapPage(QWidget):
 
         # Apply view transforms after drawing overlay so it stays aligned.
         bgr = self._apply_view_transform(bgr)
+
+        if self._enable_overlay.isChecked():
+            stale = age_ms is not None and age_ms > self._tof_stale_ms
+            no_tof = self._last_tof_time_s is None
+            if (stale or no_tof) and not overlay_drawn:
+                h_img, w_img = bgr.shape[:2]
+                overlay = bgr.copy()
+                cv2.rectangle(overlay, (0, 0), (w_img, 40), (0, 0, 0), -1)
+                if no_tof:
+                    msg = "ToF data missing"
+                else:
+                    msg = f"ToF data stale: {age_ms:.0f} ms"
+                cv2.putText(
+                    overlay,
+                    msg,
+                    (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                bgr = cv2.addWeighted(overlay, 0.6, bgr, 0.4, 0.0)
         self._show_bgr(bgr)
 
     def _show_bgr(self, bgr: np.ndarray):

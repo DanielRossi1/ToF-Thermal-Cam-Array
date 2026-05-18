@@ -33,6 +33,7 @@ Usage (from calibration_page.py)
 from __future__ import annotations
 import threading
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
@@ -77,11 +78,12 @@ class ExtrinsicPair:
 class CalibResult:
     rms_error: float                            # px — intrinsic reprojection RMS
     camera_matrix: np.ndarray                  # (3,3)
-    dist_coeffs: np.ndarray                    # (1,5)
+    dist_coeffs: np.ndarray                    # (N,) / (1,N) where N=5 (pinhole) or N=4 (fisheye)
     rvecs: list
     tvecs: list
     n_frames: int
     timestamp_s: float
+    camera_model: str = "pinhole"              # 'pinhole' | 'fisheye'
     # Extrinsic RGB ↔ ToF  (None if not enough pairs)
     R_tof_to_rgb: Optional[np.ndarray] = None  # (3,3)
     t_tof_to_rgb: Optional[np.ndarray] = None  # (3,)  metres
@@ -205,6 +207,11 @@ class CalibrationSession:
         tof_fov_deg: float = 45.0,
         recalib_every: int = 3,
         min_frames_calib: int = 5,
+        tof_rot_k: int = 0,
+        tof_flip_x: bool = False,
+        tof_flip_y: bool = False,
+        board_offset_xy_mm: Tuple[float, float] = (0.0, 0.0),
+        camera_model: str = "pinhole",
     ):
         self.aruco_dict_id = aruco_dict_id
         self.pattern = str(pattern).lower().strip() or "aruco"
@@ -221,9 +228,23 @@ class CalibrationSession:
         self.recalib_every = recalib_every
         self.min_frames_calib = min_frames_calib
 
+        self.camera_model = str(camera_model or "pinhole").strip().lower()
+        if self.camera_model not in ("pinhole", "fisheye"):
+            self.camera_model = "pinhole"
+
+        try:
+            self._tof_rot_k = int(tof_rot_k) % 4
+        except Exception:
+            self._tof_rot_k = 0
+        self._tof_flip_x = bool(tof_flip_x)
+        self._tof_flip_y = bool(tof_flip_y)
+        self._set_board_offset(board_offset_xy_mm)
+
         self.frames: List[CalibFrame] = []
         self.ext_pairs: List[ExtrinsicPair] = []
         self.latest_result: Optional[CalibResult] = None
+
+        self._extrinsic_only = False
 
         self._scorer = FrameQualityScorer()
         self._frame_idx = 0
@@ -299,10 +320,31 @@ class CalibrationSession:
             'charuco_square_length_m', 'charuco_marker_length_m',
         ))
         for k, v in kwargs.items():
+            if k == 'board_offset_xy_mm':
+                self._set_board_offset(v)
+                continue
             if hasattr(self, k):
                 setattr(self, k, v)
+        if 'tof_rot_k' in kwargs:
+            try:
+                self._tof_rot_k = int(kwargs.get('tof_rot_k', 0)) % 4
+            except Exception:
+                self._tof_rot_k = 0
+        if 'tof_flip_x' in kwargs:
+            self._tof_flip_x = bool(kwargs.get('tof_flip_x', False))
+        if 'tof_flip_y' in kwargs:
+            self._tof_flip_y = bool(kwargs.get('tof_flip_y', False))
         if rebuild:
             self._setup_cv()
+
+    def _set_board_offset(self, offset_xy_mm):
+        try:
+            off_x_mm, off_y_mm = offset_xy_mm
+        except Exception:
+            off_x_mm, off_y_mm = 0.0, 0.0
+        self._board_offset_m = np.array(
+            [float(off_x_mm), float(off_y_mm), 0.0], dtype=np.float64
+        ) / 1000.0
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -322,10 +364,29 @@ class CalibrationSession:
         self._since_last_calib = 0
         self._image_size     = None
         self._running        = True
+        self._extrinsic_only = False
         # Background calibration threading.
         self._calib_lock     = threading.Lock()
         self._calib_thread: Optional[threading.Thread] = None
         self._pending_calib: Optional[CalibResult] = None
+
+    def start_extrinsic(self, intrinsic: CalibResult):
+        """Start an extrinsic-only acquisition phase using fixed intrinsics."""
+        self.frames.clear()
+        self.ext_pairs.clear()
+        self.latest_result = intrinsic
+        try:
+            self.camera_model = str(getattr(intrinsic, 'camera_model', self.camera_model) or self.camera_model).strip().lower()
+        except Exception:
+            pass
+        self._frame_idx = 0
+        self._since_last_calib = 0
+        self._image_size = None
+        self._running = True
+        self._extrinsic_only = True
+        self._calib_lock = threading.Lock()
+        self._calib_thread = None
+        self._pending_calib = None
 
     def stop(self):
         self._running = False
@@ -386,14 +447,31 @@ class CalibrationSession:
         if self.pattern == "charuco" and self._board is not None and ids is not None and len(ids) > 0:
             try:
                 gray = self._cv2.cvtColor(detect_bgr, self._cv2.COLOR_BGR2GRAY)
-                cc, ci, _ = self._aruco.interpolateCornersCharuco(
-                    markerCorners=corners,
-                    markerIds=ids,
-                    image=gray,
-                    board=self._board,
-                )
-                if cc is not None and ci is not None and len(ci) > 0:
-                    charuco_corners, charuco_ids = cc, ci
+
+                if hasattr(self._cv2.aruco, "CharucoDetector"):
+                    detector = self._cv2.aruco.CharucoDetector(self._board)
+                    charuco_corners, charuco_ids, _, _ = detector.detectBoard(gray)
+
+                if charuco_corners is None or charuco_ids is None or len(charuco_ids) == 0:
+                    try:
+                        result = self._aruco.interpolateCornersCharuco(
+                            markerCorners=corners,
+                            markerIds=ids,
+                            image=gray,
+                            board=self._board,
+                            minMarkers=1,
+                        )
+                        if isinstance(result, tuple) and len(result) == 3:
+                            retval, charuco_corners, charuco_ids = result
+                        elif isinstance(result, tuple) and len(result) == 2:
+                            charuco_corners, charuco_ids = result
+                            retval = len(charuco_ids) if charuco_ids is not None else 0
+                        else:
+                            retval = 0
+                        if retval == 0:
+                            charuco_corners, charuco_ids = None, None
+                    except Exception:
+                        charuco_corners, charuco_ids = None, None
             except Exception:
                 charuco_corners, charuco_ids = None, None
 
@@ -444,37 +522,39 @@ class CalibrationSession:
                 if pair is not None:
                     self.ext_pairs.append(pair)
                     
-            # Trigger background calibration — never blocks the stream.
-            calib_due = (
-                self._since_last_calib >= self.recalib_every
-                and len(self.frames)    >= self.min_frames_calib
-            )
-            thread_idle = (self._calib_thread is None or not self._calib_thread.is_alive())
+            if not self._extrinsic_only:
+                # Trigger background calibration — never blocks the stream.
+                calib_due = (
+                    self._since_last_calib >= self.recalib_every
+                    and len(self.frames)    >= self.min_frames_calib
+                )
+                thread_idle = (self._calib_thread is None or not self._calib_thread.is_alive())
 
-            if calib_due and thread_idle:
-                snap_frames = list(self.frames)     # snapshot; list() is thread-safe enough here
-                snap_pairs  = list(self.ext_pairs)
-                _w, _h      = w, h
+                if calib_due and thread_idle:
+                    snap_frames = list(self.frames)     # snapshot; list() is thread-safe enough here
+                    snap_pairs  = list(self.ext_pairs)
+                    _w, _h      = w, h
 
-                def _bg_calib():
-                    best = sorted(snap_frames, key=lambda f: f.quality_score, reverse=True)[:self.top_k]
-                    calib = (
-                        self._calibrate_charuco_on(best, _w, _h)
-                        if self.pattern == "charuco" else
-                        self._calibrate_on(best, _w, _h)
-                    )
-                    if calib is None:
-                        return
-                    if len(snap_pairs) >= 4:
-                        R, t, rms_mm = self._solve_extrinsic_on(snap_pairs)
-                        calib.R_tof_to_rgb    = R
-                        calib.t_tof_to_rgb    = t
-                        calib.extrinsic_rms_mm = rms_mm
-                    with self._calib_lock:
-                        self._pending_calib = calib
+                    def _bg_calib():
+                        best = sorted(snap_frames, key=lambda f: f.quality_score, reverse=True)[:self.top_k]
+                        calib = (
+                            self._calibrate_charuco_on(best, _w, _h)
+                            if self.pattern == "charuco" else
+                            self._calibrate_on(best, _w, _h)
+                        )
+                        if calib is None:
+                            return
+                        if len(snap_pairs) >= 4:
+                            R, t, rms_mm = self._solve_extrinsic_on(snap_pairs)
+                            calib.R_tof_to_rgb    = R
+                            calib.t_tof_to_rgb    = t
+                            calib.extrinsic_rms_mm = rms_mm
+                            self._warn_if_implausible_translation(t, context="background")
+                        with self._calib_lock:
+                            self._pending_calib = calib
 
-                self._calib_thread = threading.Thread(target=_bg_calib, daemon=True)
-                self._calib_thread.start()
+                    self._calib_thread = threading.Thread(target=_bg_calib, daemon=True)
+                    self._calib_thread.start()
 
         out['n_frames'] = len(self.frames)
         return out
@@ -485,6 +565,8 @@ class CalibrationSession:
         """Stop when pool is full; only allow RMS stop after enough frames."""
         if len(self.frames) >= self.n_total:
             return True
+        if self._extrinsic_only:
+            return len(self.ext_pairs) >= min(self.top_k, self.n_total)
         # Prevent premature stop before we can meaningfully select top_k.
         if (
             len(self.frames) >= min(self.top_k, self.n_total)
@@ -495,6 +577,8 @@ class CalibrationSession:
         return False
 
     def stop_reason(self) -> str:
+        if self._extrinsic_only and len(self.ext_pairs) >= min(self.top_k, self.n_total):
+            return f"extrinsic pairs reached ({len(self.ext_pairs)})"
         if len(self.frames) >= self.n_total:
             return f"max frames reached ({self.n_total})"
         if (
@@ -508,6 +592,41 @@ class CalibrationSession:
     def finalize(self) -> Optional[CalibResult]:
         if not self.frames:
             return None
+
+        if self._extrinsic_only:
+            if self.latest_result is None:
+                return None
+            calib = CalibResult(
+                rms_error=float(self.latest_result.rms_error),
+                camera_matrix=np.asarray(self.latest_result.camera_matrix, dtype=np.float64),
+                dist_coeffs=np.asarray(self.latest_result.dist_coeffs, dtype=np.float64),
+                rvecs=list(getattr(self.latest_result, 'rvecs', [])),
+                tvecs=list(getattr(self.latest_result, 'tvecs', [])),
+                n_frames=len(self.frames),
+                timestamp_s=time.time(),
+                camera_model=str(getattr(self.latest_result, 'camera_model', self.camera_model) or self.camera_model),
+            )
+            # Use a quality-based subset for robustness.
+            frames_for_ext = sorted(self.frames, key=lambda f: f.quality_score, reverse=True)[:self.top_k]
+            pairs: List[ExtrinsicPair] = []
+            K_final, D_final = calib.camera_matrix, calib.dist_coeffs
+            for f in frames_for_ext:
+                if f.tof_dist_mm is None:
+                    continue
+                p_rgb = self._p_rgb_from_frame(f, K_final, D_final)
+                if p_rgb is None:
+                    continue
+                p_tof = self._tof_cube_centre(f.tof_dist_mm, f.tof_sigma_mm, f.tof_status)
+                if p_tof is None:
+                    continue
+                pairs.append(ExtrinsicPair(frame_idx=f.idx, p_rgb=p_rgb, p_tof=p_tof))
+
+            if len(pairs) >= 4:
+                result = self._solve_extrinsic_robust(pairs)
+                if result[0] is not None:
+                    calib.R_tof_to_rgb, calib.t_tof_to_rgb, calib.extrinsic_rms_mm = result
+                    self._warn_if_implausible_translation(calib.t_tof_to_rgb, context="extrinsic-only finalize")
+            return calib
 
         # 1. First Pass: Initial calibration using the top_k best quality frames
         best_frames = sorted(self.frames, key=lambda f: f.quality_score, reverse=True)[:self.top_k]
@@ -555,7 +674,6 @@ class CalibrationSession:
         final_pairs: List[ExtrinsicPair] = []
         K_final, D_final = calib.camera_matrix, calib.dist_coeffs
 
-        obj_p = self._obj_pts()
         for f in refined_frames:
             if f.tof_dist_mm is None:
                 continue
@@ -568,12 +686,36 @@ class CalibrationSession:
 
         if len(final_pairs) >= 4:
             # Use RANSAC-style solver to ignore bad ToF depth jumps
-            R, t, rms_mm = self._solve_extrinsic_robust(final_pairs)
-            calib.R_tof_to_rgb = R
-            calib.t_tof_to_rgb = t
-            calib.extrinsic_rms_mm = rms_mm
+            result = self._solve_extrinsic_robust(final_pairs)
+            if result[0] is not None:
+                calib.R_tof_to_rgb, calib.t_tof_to_rgb, calib.extrinsic_rms_mm = result
+                self._warn_if_implausible_translation(calib.t_tof_to_rgb, context="finalize")
 
         return calib
+
+    def _warn_if_implausible_translation(self, t_m: Optional[np.ndarray], context: str = ""):
+        """Warn when |t| is so large it likely indicates a correspondence issue."""
+        if t_m is None:
+            return
+        try:
+            t = np.asarray(t_m, dtype=np.float64).reshape(-1)[:3]
+            if t.size != 3:
+                return
+            t_norm_mm = float(np.linalg.norm(t)) * 1000.0
+        except Exception:
+            return
+
+        # Heuristic: camera + ToF on the same small rig/PCB should be well below this.
+        if t_norm_mm > 500.0:
+            prefix = f"[{context}] " if context else ""
+            logging.warning(
+                "%sExtrinsic translation magnitude is large: |t|=%.0f mm (t=%s). "
+                "This often means the ToF zone orientation/flip is wrong, the target is too close (<60cm xtalk bias), "
+                "or the ToF foreground detection picked the wrong surface.",
+                prefix,
+                t_norm_mm,
+                np.array2string(t, precision=3, suppress_small=True),
+            )
 
     def _solve_extrinsic_robust(self, pairs: list, iterations: int = 100):
         """
@@ -588,18 +730,26 @@ class CalibrationSession:
 
         for _ in range(iterations):
             subset = random.sample(pairs, 4)
-            R, t, _ = self._solve_extrinsic_on(subset)
+            try:
+                R, t, _ = self._solve_extrinsic_on(subset)
+            except Exception:
+                continue
+            if R is None:
+                continue
             
             # Check error against ALL pairs
             P_tof = np.array([p.p_tof for p in pairs])
             P_rgb = np.array([p.p_rgb for p in pairs])
             P_pred = (R @ P_tof.T).T + t
-            rms = np.sqrt(((P_pred - P_rgb) ** 2).sum(1).mean())
+            rms = float(np.sqrt(((P_pred - P_rgb) ** 2).sum(1).mean()))
             
             if rms < min_rms:
                 min_rms = rms
                 best_R, best_t = R, t
-                
+
+        if best_R is None:
+            return self._solve_extrinsic_on(pairs)
+
         return best_R, best_t, min_rms * 1000.0
 
     def _frame_reproj_error(
@@ -612,6 +762,19 @@ class CalibrationSession:
             return None
         obj_p = self._obj_pts()
         img_p = frame.corners[0].reshape(4, 2).astype(np.float32)
+
+        if self.camera_model == "fisheye" and hasattr(self._cv2, "fisheye"):
+            D4 = np.asarray(D, dtype=np.float64).reshape(-1)[:4].reshape(4, 1)
+            und = self._cv2.fisheye.undistortPoints(
+                img_p.reshape(-1, 1, 2).astype(np.float64), K, D4, P=K
+            )
+            img_u = und.reshape(-1, 2).astype(np.float32)
+            ok, r, t = self._cv2.solvePnP(obj_p, img_u, K, np.zeros((1, 5), dtype=np.float64))
+            if not ok:
+                return None
+            proj, _ = self._cv2.projectPoints(obj_p, r, t, K, np.zeros((1, 5), dtype=np.float64))
+            return float(np.linalg.norm(img_u - proj.reshape(4, 2), axis=1).mean())
+
         ok, r, t = self._cv2.solvePnP(obj_p, img_p, K, D)
         if not ok:
             return None
@@ -622,9 +785,13 @@ class CalibrationSession:
         """Board center in board coordinates (metres)."""
         if self._board is None:
             return None
-        w_m = (self.charuco_squares_x - 1) * self.charuco_square_length_m
-        h_m = (self.charuco_squares_y - 1) * self.charuco_square_length_m
-        return np.array([w_m / 2.0, h_m / 2.0, 0.0], dtype=np.float64)
+        try:
+            chess = self._board.getChessboardCorners()
+        except Exception:
+            chess = getattr(self._board, "chessboardCorners", None)
+        if chess is None:
+            return None
+        return np.asarray(chess, dtype=np.float64).reshape(-1, 3).mean(axis=0)
 
     def _charuco_obj_points_for_ids(self, charuco_ids: np.ndarray) -> Optional[np.ndarray]:
         if self._board is None:
@@ -652,13 +819,22 @@ class CalibrationSession:
             if obj is None:
                 return None
             img = np.asarray(frame.charuco_corners, dtype=np.float32).reshape(-1, 2)
-            ok, rvec, tvec = self._cv2.solvePnP(obj.astype(np.float32), img.astype(np.float32), K, D)
+            if self.camera_model == "fisheye" and hasattr(self._cv2, "fisheye"):
+                D4 = np.asarray(D, dtype=np.float64).reshape(-1)[:4].reshape(4, 1)
+                und = self._cv2.fisheye.undistortPoints(img.reshape(-1, 1, 2).astype(np.float64), K, D4, P=K)
+                img_u = und.reshape(-1, 2).astype(np.float32)
+                ok, rvec, tvec = self._cv2.solvePnP(
+                    obj.astype(np.float32), img_u, K, np.zeros((1, 5), dtype=np.float64)
+                )
+            else:
+                ok, rvec, tvec = self._cv2.solvePnP(obj.astype(np.float32), img.astype(np.float32), K, D)
             if not ok:
                 return None
             R, _ = self._cv2.Rodrigues(rvec)
             c = self._charuco_board_center_obj()
             if c is None:
                 return None
+            c = c + self._board_offset_m
             p = (R @ c.reshape(3, 1) + tvec.reshape(3, 1)).reshape(3)
             return p.astype(np.float64)
 
@@ -666,7 +842,17 @@ class CalibrationSession:
         if frame.ids is None or len(frame.corners) == 0:
             return None
         img_p = frame.corners[0].reshape(4, 2).astype(np.float32)
-        ok, _, tvec = self._cv2.solvePnP(self._obj_pts(), img_p, K, D)
+        if self.camera_model == "fisheye" and hasattr(self._cv2, "fisheye"):
+            D4 = np.asarray(D, dtype=np.float64).reshape(-1)[:4].reshape(4, 1)
+            und = self._cv2.fisheye.undistortPoints(
+                img_p.reshape(-1, 1, 2).astype(np.float64), K, D4, P=K
+            )
+            img_u = und.reshape(-1, 2).astype(np.float32)
+            ok, _, tvec = self._cv2.solvePnP(
+                self._obj_pts(), img_u, K, np.zeros((1, 5), dtype=np.float64)
+            )
+        else:
+            ok, _, tvec = self._cv2.solvePnP(self._obj_pts(), img_p, K, D)
         if not ok:
             return None
         return tvec.flatten().astype(np.float64)
@@ -685,6 +871,21 @@ class CalibrationSession:
         if obj is None:
             return None
         img = np.asarray(frame.charuco_corners, dtype=np.float64).reshape(-1, 2)
+
+        if self.camera_model == "fisheye" and hasattr(self._cv2, "fisheye"):
+            D4 = np.asarray(D, dtype=np.float64).reshape(-1)[:4].reshape(4, 1)
+            und = self._cv2.fisheye.undistortPoints(img.reshape(-1, 1, 2).astype(np.float64), K, D4, P=K)
+            img_u = und.reshape(-1, 2).astype(np.float32)
+            ok, rvec, tvec = self._cv2.solvePnP(
+                obj.astype(np.float32), img_u, K, np.zeros((1, 5), dtype=np.float64)
+            )
+            if not ok:
+                return None
+            proj, _ = self._cv2.projectPoints(
+                obj.astype(np.float32), rvec, tvec, K, np.zeros((1, 5), dtype=np.float64)
+            )
+            return float(np.linalg.norm(img_u - proj.reshape(-1, 2), axis=1).mean())
+
         ok, rvec, tvec = self._cv2.solvePnP(obj.astype(np.float32), img.astype(np.float32), K, D)
         if not ok:
             return None
@@ -720,10 +921,27 @@ class CalibrationSession:
             return None
 
         try:
-            rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
-                obj_list, img_list, (w, h),
-                None, None,
-            )
+            if self.camera_model == "fisheye" and hasattr(cv2, "fisheye"):
+                obj_f = [np.asarray(o, dtype=np.float64).reshape(-1, 1, 3) for o in obj_list]
+                img_f = [np.asarray(i, dtype=np.float64).reshape(-1, 1, 2) for i in img_list]
+                K = np.eye(3, dtype=np.float64)
+                dist = np.zeros((4, 1), dtype=np.float64)
+                flags = (
+                    cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC |
+                    cv2.fisheye.CALIB_FIX_SKEW
+                )
+                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6)
+                rms, K, dist, rvecs, tvecs = cv2.fisheye.calibrate(
+                    obj_f, img_f, (w, h), K, dist,
+                    flags=flags, criteria=criteria,
+                )
+                model = "fisheye"
+            else:
+                rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+                    obj_list, img_list, (w, h),
+                    None, None,
+                )
+                model = "pinhole"
             return CalibResult(
                 rms_error     = float(rms),
                 camera_matrix = K,
@@ -732,6 +950,7 @@ class CalibrationSession:
                 tvecs         = list(tvecs),
                 n_frames      = len(frames),
                 timestamp_s   = time.time(),
+                camera_model  = model,
             )
         except Exception:
             return None
@@ -756,30 +975,58 @@ class CalibrationSession:
 
         aruco = self._aruco
         try:
-            if hasattr(aruco, 'calibrateCameraCharuco'):
-                rms, K, dist, rvecs, tvecs = aruco.calibrateCameraCharuco(
-                    charucoCorners=all_cc,
-                    charucoIds=all_ci,
-                    board=self._board,
-                    imageSize=(w, h),
-                    cameraMatrix=None,
-                    distCoeffs=None,
-                )
-            else:
-                # Fallback: treat each ChArUco corner as a generic 2D-3D correspondence.
+            if self.camera_model == "fisheye" and hasattr(self._cv2, "fisheye"):
                 obj_list, img_list = [], []
                 for cc, ci in zip(all_cc, all_ci):
                     obj = self._charuco_obj_points_for_ids(ci)
                     if obj is None:
                         continue
-                    img = np.asarray(cc, dtype=np.float32).reshape(-1, 2)
-                    obj_list.append(obj.astype(np.float32))
-                    img_list.append(img.astype(np.float32))
+                    img = np.asarray(cc, dtype=np.float64).reshape(-1, 2)
+                    if len(img) < 6:
+                        continue
+                    obj_list.append(np.asarray(obj, dtype=np.float64).reshape(-1, 1, 3))
+                    img_list.append(np.asarray(img, dtype=np.float64).reshape(-1, 1, 2))
                 if len(obj_list) < self.min_frames_calib:
                     return None
-                rms, K, dist, rvecs, tvecs = self._cv2.calibrateCamera(
-                    obj_list, img_list, (w, h), None, None
+
+                K = np.eye(3, dtype=np.float64)
+                dist = np.zeros((4, 1), dtype=np.float64)
+                flags = (
+                    self._cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC |
+                    self._cv2.fisheye.CALIB_FIX_SKEW
                 )
+                criteria = (self._cv2.TERM_CRITERIA_EPS + self._cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6)
+                rms, K, dist, rvecs, tvecs = self._cv2.fisheye.calibrate(
+                    obj_list, img_list, (w, h), K, dist,
+                    flags=flags, criteria=criteria,
+                )
+                model = "fisheye"
+            else:
+                if hasattr(aruco, 'calibrateCameraCharuco'):
+                    rms, K, dist, rvecs, tvecs = aruco.calibrateCameraCharuco(
+                        charucoCorners=all_cc,
+                        charucoIds=all_ci,
+                        board=self._board,
+                        imageSize=(w, h),
+                        cameraMatrix=None,
+                        distCoeffs=None,
+                    )
+                else:
+                    # Fallback: treat each ChArUco corner as a generic 2D-3D correspondence.
+                    obj_list, img_list = [], []
+                    for cc, ci in zip(all_cc, all_ci):
+                        obj = self._charuco_obj_points_for_ids(ci)
+                        if obj is None:
+                            continue
+                        img = np.asarray(cc, dtype=np.float32).reshape(-1, 2)
+                        obj_list.append(obj.astype(np.float32))
+                        img_list.append(img.astype(np.float32))
+                    if len(obj_list) < self.min_frames_calib:
+                        return None
+                    rms, K, dist, rvecs, tvecs = self._cv2.calibrateCamera(
+                        obj_list, img_list, (w, h), None, None
+                    )
+                model = "pinhole"
 
             return CalibResult(
                 rms_error     = float(rms),
@@ -789,6 +1036,7 @@ class CalibrationSession:
                 tvecs         = list(tvecs),
                 n_frames      = len(frames),
                 timestamp_s   = time.time(),
+                camera_model  = model,
             )
         except Exception:
             return None
@@ -823,6 +1071,7 @@ class CalibrationSession:
         K = self.latest_result.camera_matrix
         D = self.latest_result.dist_coeffs
 
+        # Note: uses board center vs ToF depth centroid; adjust board_offset_xy_mm if needed.
         p_rgb = self._p_rgb_from_frame(frame, K, D)
         if p_rgb is None:
             return None
@@ -916,6 +1165,32 @@ class CalibrationSession:
         """
         if dist_mm is None or not isinstance(dist_mm, np.ndarray) or dist_mm.ndim != 2:
             return None
+
+        # Match overlap_page reshape(res,res).T convention and transforms.
+        dist_mm = dist_mm.T
+        if sigma_mm is not None:
+            sigma_mm = sigma_mm.T
+        if status is not None:
+            status = status.T
+        if self._tof_rot_k:
+            dist_mm = np.rot90(dist_mm, self._tof_rot_k)
+            if sigma_mm is not None:
+                sigma_mm = np.rot90(sigma_mm, self._tof_rot_k)
+            if status is not None:
+                status = np.rot90(status, self._tof_rot_k)
+        if self._tof_flip_x:
+            dist_mm = np.flipud(dist_mm)
+            if sigma_mm is not None:
+                sigma_mm = np.flipud(sigma_mm)
+            if status is not None:
+                status = np.flipud(status)
+        if self._tof_flip_y:
+            dist_mm = np.fliplr(dist_mm)
+            if sigma_mm is not None:
+                sigma_mm = np.fliplr(sigma_mm)
+            if status is not None:
+                status = np.fliplr(status)
+
         rows, cols = dist_mm.shape
 
         base_valid = (dist_mm > 0) & (dist_mm < 8000)
@@ -1049,6 +1324,9 @@ class CalibrationSession:
             rms_error=np.array([result.rms_error]),
             n_frames=np.array([result.n_frames]),
             tof_fov_deg=np.array([self.tof_fov_deg]),
+            camera_model=np.array([
+                1 if str(getattr(result, 'camera_model', 'pinhole')).lower() == 'fisheye' else 0
+            ], dtype=np.int32),
         )
         if result.R_tof_to_rgb is not None:
             save_dict["R_tof_to_rgb"] = result.R_tof_to_rgb
@@ -1067,8 +1345,15 @@ class CalibrationSession:
             f.write("Camera matrix (K):\n")
             for row in result.camera_matrix:
                 f.write("  " + "  ".join(f"{v:12.4f}" for v in row) + "\n")
-            f.write("\nDistortion coefficients (k1 k2 p1 p2 k3):\n")
-            f.write("  " + "  ".join(f"{v:10.6f}" for v in result.dist_coeffs.flatten()) + "\n")
+
+            d = np.asarray(result.dist_coeffs, dtype=np.float64).reshape(-1)
+            is_fisheye = (str(getattr(result, 'camera_model', 'pinhole')).lower() == 'fisheye') or (d.size == 4)
+            if is_fisheye:
+                f.write("\nDistortion coefficients (fisheye k1 k2 k3 k4):\n")
+                f.write("  " + "  ".join(f"{v:10.6f}" for v in d[:4]) + "\n")
+            else:
+                f.write("\nDistortion coefficients (k1 k2 p1 p2 k3):\n")
+                f.write("  " + "  ".join(f"{v:10.6f}" for v in d[:5]) + "\n")
             if result.R_tof_to_rgb is not None:
                 f.write(f"\nExtrinsic RMS   : {result.extrinsic_rms_mm:.2f} mm\n")
                 f.write("R (ToF → RGB):\n")

@@ -239,7 +239,8 @@ class ResultsPanel(QWidget):
         self._save_btn.setEnabled(True)
 
         K = result.camera_matrix
-        d = result.dist_coeffs.flatten()
+        d = np.asarray(result.dist_coeffs).flatten()
+        is_fisheye = (str(getattr(result, 'camera_model', 'pinhole')).lower() == 'fisheye') or (d.size == 4)
 
         rms_col = _GOOD if result.rms_error < 1.0 else (_WARN if result.rms_error < 2.0 else _BAD)
 
@@ -252,8 +253,8 @@ class ResultsPanel(QWidget):
             f"  fx = {K[0,0]:.2f}  fy = {K[1,1]:.2f}",
             f"  cx = {K[0,2]:.2f}  cy = {K[1,2]:.2f}",
             "",
-            "<b>Distortion (k1 k2 p1 p2 k3)</b>",
-            "  " + "  ".join(f"{v:+.5f}" for v in d[:5]),
+            ("<b>Distortion (fisheye k1 k2 k3 k4)</b>" if is_fisheye else "<b>Distortion (k1 k2 p1 p2 k3)</b>"),
+            "  " + "  ".join(f"{v:+.5f}" for v in (d[:4] if is_fisheye else d[:5])),
         ]
 
         if result.R_tof_to_rgb is not None:
@@ -308,9 +309,14 @@ class CalibrationPage(QWidget):
 
         # Session (lazily created / re-created on Start)
         self._session: Optional[CalibrationSession] = None
+        self._intrinsic_result: Optional[CalibResult] = None
+        self._acq_mode: str = "idle"  # 'intrinsic' | 'extrinsic' | 'idle'
         self._last_w = 0
         self._last_h = 0
         self._flash_remaining = 0   # countdown ticks for green flash
+        self._tof_rot_k = 0
+        self._tof_flip_x = False
+        self._tof_flip_y = False
 
         self._build_ui()
 
@@ -401,6 +407,11 @@ class CalibrationPage(QWidget):
         ])
         form.addRow("Dictionary", self._dict_cb)
 
+        self._cam_model_cb = QComboBox()
+        self._cam_model_cb.addItems(["Pinhole", "Fisheye"])
+        self._cam_model_cb.setCurrentText("Pinhole")
+        form.addRow("Camera model", self._cam_model_cb)
+
         self._marker_sz = QDoubleSpinBox()
         self._marker_sz.setRange(0.01, 1.0)
         self._marker_sz.setDecimals(3)
@@ -433,6 +444,31 @@ class CalibrationPage(QWidget):
         self._tof_fov.setSuffix(" °")
         form.addRow("ToF FoV", self._tof_fov)
 
+        self._board_off_x = QDoubleSpinBox()
+        self._board_off_x.setRange(-200.0, 200.0)
+        self._board_off_x.setDecimals(1)
+        self._board_off_x.setSingleStep(1.0)
+        self._board_off_x.setValue(0.0)
+        self._board_off_x.setSuffix(" mm")
+        self._board_off_x.setToolTip("Board offset from box center along board X axis")
+        form.addRow("Board offset X", self._board_off_x)
+
+        self._board_off_y = QDoubleSpinBox()
+        self._board_off_y.setRange(-200.0, 200.0)
+        self._board_off_y.setDecimals(1)
+        self._board_off_y.setSingleStep(1.0)
+        self._board_off_y.setValue(0.0)
+        self._board_off_y.setSuffix(" mm")
+        self._board_off_y.setToolTip("Board offset from box center along board Y axis")
+        form.addRow("Board offset Y", self._board_off_y)
+
+        note = QLabel(
+            "Extrinsic pairs use board center vs ToF centroid; adjust offsets if needed."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{_MUTED}; font-size:10px;")
+        form.addRow(note)
+
         self._on_pattern_changed()
 
         return gb
@@ -441,8 +477,10 @@ class CalibrationPage(QWidget):
         gb = _section("Acquisition")
         lay = QVBoxLayout(gb)
 
-        # Start / Stop button
-        self._start_btn = QPushButton("▶  Start Acquisition")
+        btn_row = QHBoxLayout()
+
+        # Intrinsic start/stop
+        self._start_btn = QPushButton("▶  Start Intrinsic")
         self._start_btn.setMinimumHeight(36)
         self._start_btn.setStyleSheet(
             f"QPushButton {{ background:#0a1f10; border:1px solid {_GOOD}; "
@@ -451,7 +489,23 @@ class CalibrationPage(QWidget):
             f"QPushButton:pressed {{ background:#0d2212; }}"
         )
         self._start_btn.clicked.connect(self._on_start_stop)
-        lay.addWidget(self._start_btn)
+        btn_row.addWidget(self._start_btn)
+
+        # Extrinsic start/stop (enabled after intrinsics exist)
+        self._start_ext_btn = QPushButton("▶  Start Extrinsic")
+        self._start_ext_btn.setMinimumHeight(36)
+        self._start_ext_btn.setEnabled(False)
+        self._start_ext_btn.setStyleSheet(
+            f"QPushButton {{ background:#1a1a30; border:1px solid {_ACCENT}; "
+            f"color:{_ACCENT}; font-weight:bold; border-radius:5px; }}"
+            f"QPushButton:hover {{ background:#22224a; }}"
+            f"QPushButton:pressed {{ background:#0d0d20; }}"
+            f"QPushButton:disabled {{ color:{_MUTED}; border-color:{_BORDER}; }}"
+        )
+        self._start_ext_btn.clicked.connect(self._on_start_extrinsic_stop)
+        btn_row.addWidget(self._start_ext_btn)
+
+        lay.addLayout(btn_row)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
@@ -526,9 +580,15 @@ class CalibrationPage(QWidget):
         if self._session and self._session.is_running:
             self._finish_session("manual stop")
         else:
-            self._start_session()
+            self._start_intrinsic_session()
 
-    def _start_session(self):
+    def _on_start_extrinsic_stop(self):
+        if self._session and self._session.is_running:
+            self._finish_session("manual stop")
+        else:
+            self._start_extrinsic_session()
+
+    def _start_intrinsic_session(self):
         try:
             import cv2
             dict_name = self._dict_cb.currentText().strip()
@@ -537,6 +597,7 @@ class CalibrationPage(QWidget):
             dict_id = 0  # DICT_4X4_50
 
         pattern = "charuco" if self._pattern_cb.currentText().startswith("Ch") else "aruco"
+        cam_model = "fisheye" if self._cam_model_cb.currentText().startswith("Fish") else "pinhole"
         self._session = CalibrationSession(
             aruco_dict_id=dict_id,
             pattern=pattern,
@@ -551,8 +612,16 @@ class CalibrationPage(QWidget):
             target_rms=self._target_rms.value(),
             tof_fov_deg=self._tof_fov.value(),
             recalib_every=self._recalib_every.value(),
+            tof_rot_k=self._tof_rot_k,
+            tof_flip_x=self._tof_flip_x,
+            tof_flip_y=self._tof_flip_y,
+            board_offset_xy_mm=(self._board_off_x.value(), self._board_off_y.value()),
+            camera_model=cam_model,
         )
         self._session.start()
+
+        self._acq_mode = "intrinsic"
+        self._intrinsic_result = None
 
         self._results.clear()
         self._prog.setRange(0, self._n_total.value())
@@ -562,14 +631,71 @@ class CalibrationPage(QWidget):
         )
         self._lbl_frames.setText(f"0 / {self._n_total.value()}")
         self._lbl_rms.setText("—")
-        self._set_status("acquiring …", _ACCENT)
+        self._set_status("intrinsic acquiring … (ToF ignored)", _ACCENT)
 
-        self._start_btn.setText("■  Stop Acquisition")
+        self._start_btn.setText("■  Stop Intrinsic")
         self._start_btn.setStyleSheet(
             f"QPushButton {{ background:#1f0a0a; border:1px solid {_BAD}; "
             f"color:{_BAD}; font-weight:bold; border-radius:5px; }}"
             f"QPushButton:hover {{ background:#2a1212; }}"
         )
+        self._set_controls_enabled(False)
+        self._start_ext_btn.setEnabled(False)
+
+    def _start_extrinsic_session(self):
+        if self._intrinsic_result is None:
+            self._set_status("run intrinsic first", _WARN)
+            return
+
+        try:
+            import cv2
+            dict_name = self._dict_cb.currentText().strip()
+            dict_id = getattr(cv2.aruco, dict_name, cv2.aruco.DICT_4X4_50)
+        except Exception:
+            dict_id = 0
+
+        pattern = "charuco" if self._pattern_cb.currentText().startswith("Ch") else "aruco"
+        cam_model = str(getattr(self._intrinsic_result, 'camera_model', 'pinhole') or 'pinhole')
+        self._session = CalibrationSession(
+            aruco_dict_id=dict_id,
+            pattern=pattern,
+            marker_length_m=self._marker_sz.value(),
+            charuco_squares_x=self._charuco_x.value(),
+            charuco_squares_y=self._charuco_y.value(),
+            charuco_square_length_m=self._charuco_sq.value(),
+            charuco_marker_length_m=self._charuco_mk.value(),
+            n_total=self._n_total.value(),
+            top_k=self._top_k.value(),
+            quality_threshold=self._quality_thr.value(),
+            target_rms=self._target_rms.value(),
+            tof_fov_deg=self._tof_fov.value(),
+            recalib_every=self._recalib_every.value(),
+            tof_rot_k=self._tof_rot_k,
+            tof_flip_x=self._tof_flip_x,
+            tof_flip_y=self._tof_flip_y,
+            board_offset_xy_mm=(self._board_off_x.value(), self._board_off_y.value()),
+            camera_model=cam_model,
+        )
+        self._session.start_extrinsic(self._intrinsic_result)
+        self._acq_mode = "extrinsic"
+
+        self._results.clear()
+        self._prog.setRange(0, self._n_total.value())
+        self._prog.setValue(0)
+        self._prog.setStyleSheet(
+            f"QProgressBar::chunk {{ background: {_ACCENT}; }}"
+        )
+        self._lbl_frames.setText(f"0 / {self._n_total.value()}")
+        self._lbl_rms.setText(f"{self._intrinsic_result.rms_error:.3f} px")
+        self._set_status("extrinsic acquiring … (board fixed on box)", _ACCENT)
+
+        self._start_ext_btn.setText("■  Stop Extrinsic")
+        self._start_ext_btn.setStyleSheet(
+            f"QPushButton {{ background:#1f0a0a; border:1px solid {_BAD}; "
+            f"color:{_BAD}; font-weight:bold; border-radius:5px; }}"
+            f"QPushButton:hover {{ background:#2a1212; }}"
+        )
+        self._start_btn.setEnabled(False)
         self._set_controls_enabled(False)
 
     def _finish_session(self, reason: str = ""):
@@ -579,11 +705,23 @@ class CalibrationPage(QWidget):
         self._session.stop()
         result = self._session.finalize()
 
-        self._start_btn.setText("▶  Start Acquisition")
+        self._acq_mode = "idle"
+
+        self._start_btn.setEnabled(True)
+        self._start_btn.setText("▶  Start Intrinsic")
         self._start_btn.setStyleSheet(
             f"QPushButton {{ background:#0a1f10; border:1px solid {_GOOD}; "
             f"color:{_GOOD}; font-weight:bold; border-radius:5px; }}"
             f"QPushButton:hover {{ background:#122a18; }}"
+        )
+
+        self._start_ext_btn.setText("▶  Start Extrinsic")
+        self._start_ext_btn.setStyleSheet(
+            f"QPushButton {{ background:#1a1a30; border:1px solid {_ACCENT}; "
+            f"color:{_ACCENT}; font-weight:bold; border-radius:5px; }}"
+            f"QPushButton:hover {{ background:#22224a; }}"
+            f"QPushButton:pressed {{ background:#0d0d20; }}"
+            f"QPushButton:disabled {{ color:{_MUTED}; border-color:{_BORDER}; }}"
         )
         self._set_controls_enabled(True)
 
@@ -595,6 +733,11 @@ class CalibrationPage(QWidget):
                 f"QProgressBar::chunk {{ background: {col}; }}"
             )
             self._results.show_result(result, self._session)
+
+            # Enable extrinsic capture only once we have intrinsics.
+            if result.camera_matrix is not None and result.dist_coeffs is not None:
+                self._intrinsic_result = result
+                self._start_ext_btn.setEnabled(True)
         else:
             self._set_status("not enough frames", _BAD)
 
@@ -607,9 +750,12 @@ class CalibrationPage(QWidget):
         cam_h    = int(getattr(sf, "cam_h", 0))
 
         tof = getattr(sf, "tof", None)
-        # Pass the full ToF frame so calibration can pick the best target using
-        # status/sigma, not only distance_mm[:,0].
-        tof_dist = tof
+        if self._acq_mode == "extrinsic":
+            # Extrinsic phase: use ToF.
+            tof_dist = tof
+        else:
+            # Intrinsic phase or idle: ignore ToF.
+            tof_dist = None
 
         if cam_w:
             self._last_w = cam_w
@@ -710,12 +856,30 @@ class CalibrationPage(QWidget):
 
     def _set_controls_enabled(self, enabled: bool):
         for w in (
-            self._pattern_cb, self._dict_cb, self._marker_sz, self._tof_fov,
+            self._pattern_cb, self._dict_cb, self._cam_model_cb, self._marker_sz, self._tof_fov,
             self._charuco_x, self._charuco_y, self._charuco_sq, self._charuco_mk,
+            self._board_off_x, self._board_off_y,
             self._quality_thr, self._n_total, self._top_k,
             self._target_rms, self._recalib_every,
         ):
             w.setEnabled(enabled)
+
+    def set_config(self, cfg: dict):
+        try:
+            self._tof_rot_k = (int(cfg.get('tof_rot', 0)) // 90) % 4
+        except Exception:
+            self._tof_rot_k = 0
+        self._tof_flip_x = bool(cfg.get('tof_flip_x', False))
+        self._tof_flip_y = bool(cfg.get('tof_flip_y', False))
+
+        try:
+            cm = str(cfg.get('camera_model', '')).strip().lower()
+            if cm == 'fisheye':
+                self._cam_model_cb.setCurrentText('Fisheye')
+            elif cm:
+                self._cam_model_cb.setCurrentText('Pinhole')
+        except Exception:
+            pass
 
     def _on_pattern_changed(self):
         is_charuco = self._pattern_cb.currentText().startswith("Ch")
