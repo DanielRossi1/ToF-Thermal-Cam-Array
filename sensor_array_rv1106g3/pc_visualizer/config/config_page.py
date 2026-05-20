@@ -5,6 +5,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QGroupBox, QFormLayout, QLineEdit, QSpinBox,
     QComboBox, QCheckBox, QPushButton, QHBoxLayout, QLabel, QFileDialog,
     QGridLayout, QDoubleSpinBox, QSizePolicy, QFrame,
+    QScrollArea,
 )
 from PyQt5.QtCore import pyqtSignal, Qt
 from PyQt5.QtGui import QFont
@@ -87,6 +88,8 @@ def _float_edit(value: float = 0.0, tip: str = "") -> QLineEdit:
     w = QLineEdit(f"{value:.6g}")
     w.setFont(QFont("Consolas", 9))
     w.setAlignment(Qt.AlignRight)
+    w.setMinimumWidth(60)
+    w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
     if tip:
         w.setToolTip(tip)
     return w
@@ -125,10 +128,14 @@ class MatrixEdit(QWidget):
             row_edits = []
             for c in range(cols):
                 e = _float_edit(1.0 if r == c else 0.0)
-                e.setFixedWidth(72)
+                e.setMinimumWidth(60)
+                e.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
                 g.addWidget(e, r, c)
                 row_edits.append(e)
             self._edits.append(row_edits)
+
+        for c in range(cols):
+            g.setColumnStretch(c, 1)
 
     def set_matrix(self, arr: np.ndarray):
         arr = np.asarray(arr, dtype=float)
@@ -160,10 +167,10 @@ class VectorEdit(QWidget):
             if labels:
                 h.addWidget(QLabel(labels[i]))
             e = _float_edit()
-            e.setFixedWidth(72)
-            h.addWidget(e)
+            e.setMinimumWidth(60)
+            e.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            h.addWidget(e, 1)
             self._edits.append(e)
-        h.addStretch()
 
     def set_vector(self, arr):
         arr = np.asarray(arr, dtype=float).flatten()
@@ -183,22 +190,44 @@ class ConfigPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(_BASE_STYLE)
-        root = QVBoxLayout(self)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        outer.addWidget(scroll)
+
+        container = QWidget()
+        scroll.setWidget(container)
+
+        root = QVBoxLayout(container)
         root.setSpacing(6)
         root.setContentsMargins(8, 8, 8, 8)
 
         # ── Network ───────────────────────────────────────────────────────────
         net  = QGroupBox("Network")
+        net.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         netl = QFormLayout(net)
         netl.setLabelAlignment(Qt.AlignRight)
+        netl.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         self._proto = QComboBox()
         self._proto.addItems(["TCP", "UDP"])
+        self._proto.setMinimumWidth(90)
+        self._proto.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
 
         self._host = QLineEdit()
+        self._host.setMinimumWidth(90)
+        self._host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self._port = QSpinBox()
         self._port.setRange(1, 65535)
+        self._port.setMinimumWidth(90)
+        self._port.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
 
         self._auto_reconnect = QCheckBox("Auto-reconnect")
 
@@ -210,6 +239,7 @@ class ConfigPage(QWidget):
 
         # ── Calibration ───────────────────────────────────────────────────────
         calib   = QGroupBox("Calibration — Intrinsics & Extrinsics")
+        calib.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         calib_l = QVBoxLayout(calib)
         calib_l.setSpacing(4)
 
@@ -239,11 +269,11 @@ class ConfigPage(QWidget):
             col.setSpacing(2)
             col.addWidget(QLabel(lbl_text))
             edit = _float_edit(tip=f"Focal length / principal point — {lbl_text}")
-            edit.setFixedWidth(90)
+            edit.setMinimumWidth(90)
+            edit.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
             setattr(self, attr, edit)
             col.addWidget(edit)
-            fx_cy_row.addLayout(col)
-        fx_cy_row.addStretch()
+            fx_cy_row.addLayout(col, 1)
         calib_l.addLayout(fx_cy_row)
 
         # Camera model
@@ -253,8 +283,9 @@ class ConfigPage(QWidget):
         self._cam_model = QComboBox()
         self._cam_model.addItems(["Pinhole", "Fisheye"])
         self._cam_model.setCurrentText("Pinhole")
+        self._cam_model.setMinimumWidth(90)
+        self._cam_model.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         cm_row.addWidget(self._cam_model)
-        cm_row.addStretch()
         calib_l.addLayout(cm_row)
 
         # Distortion
@@ -300,10 +331,10 @@ class ConfigPage(QWidget):
         self._tof_fov.setValue(45.0)
         self._tof_fov.setSingleStep(0.5)
         self._tof_fov.setDecimals(1)
-        self._tof_fov.setFixedWidth(80)
+        self._tof_fov.setMinimumWidth(90)
+        self._tof_fov.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         self._tof_fov.setToolTip("Full field-of-view of the VL53L8CH sensor (degrees)")
-        fov_row.addWidget(self._tof_fov)
-        fov_row.addStretch()
+        fov_row.addWidget(self._tof_fov, 1)
         calib_l.addLayout(fov_row)
 
         # Validation label
@@ -315,6 +346,7 @@ class ConfigPage(QWidget):
 
         # ── View transforms ───────────────────────────────────────────────────
         views = QGroupBox("View Transforms")
+        views.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         vsl   = QVBoxLayout(views)
         vsl.addWidget(self._make_transform_group("ToF",    "tof"))
         vsl.addWidget(self._make_transform_group("MLX",    "mlx"))
@@ -343,10 +375,15 @@ class ConfigPage(QWidget):
 
     def _make_transform_group(self, title: str, prefix: str) -> QGroupBox:
         g  = QGroupBox(title)
+        g.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         fl = QFormLayout(g)
+        fl.setLabelAlignment(Qt.AlignRight)
+        fl.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         rot    = QComboBox()
         rot.addItems(["0", "90", "180", "270"])
+        rot.setMinimumWidth(90)
+        rot.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         flip_x = QCheckBox("Flip X")
         flip_y = QCheckBox("Flip Y")
 
